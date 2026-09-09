@@ -1,30 +1,38 @@
 package domain
 
-import "math"
+import (
+	"math"
+)
 
-//initiate a new MerkleTree
+// initiate a new MerkleTree
 func NewMerkleTree(maxLeaves int) *SegmentTree {
 	tree := &SegmentTree{
 		Nodes:     make([][]SegmentNode, 1),
 		MaxLeaves: maxLeaves,
+		Sealed:    false,
 	}
 	tree.Nodes[0] = make([]SegmentNode, 0, tree.MaxLeaves)
 	return tree
 }
 
-//Insert a log into a mutable tree
+// Insert a log into a mutable tree
 func (tree *SegmentTree) InsertLog(h [32]byte) {
+	//if sealed then cannot append
+	if tree.Sealed {
+		return
+	}
+
 	if len(tree.Nodes[0]) >= tree.MaxLeaves {
 		return
 	}
 	tree.Nodes[0] = append(tree.Nodes[0], SegmentNode{Hash: h})
 }
 
-//Build immutable segment tree
+// Build immutable segment tree
 func (tree *SegmentTree) BuildSegmentTree() [32]byte {
 	numNodes := len(tree.Nodes[0])
 	levels := int(math.Ceil(math.Log2(float64(numNodes))))
-	for l := 0; l < levels; l++ {
+	for l := range levels {
 		tree.Nodes = append(tree.Nodes, make([]SegmentNode, 0))
 		for i := 0; i < numNodes; i = i + 2 {
 			if i+1 >= numNodes {
@@ -49,4 +57,8 @@ func (tree *SegmentTree) BuildSegmentTree() [32]byte {
 
 	//return rootHash
 	return tree.Nodes[len(tree.Nodes)-1][0].Hash
+}
+
+func (tree *SegmentTree) Seal() {
+	tree.Sealed = true
 }

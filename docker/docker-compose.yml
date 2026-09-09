@@ -1,0 +1,20 @@
+services:
+  cassandra:
+    image: cassandra:5.0.9
+    container_name: hmf-cassandra
+    ports:
+     - "9042:9042"
+    volumes:
+     - cassandra-data:/var/lib/cassandra
+
+  postgresql:
+    image: postgresql:latest
+    container_name: cloud_provider
+    ports:
+    - "5432:5432"
+    volumes:
+    - cloud_provider-data:/var/lib/postgresql
+
+volumes:
+  cassandra-data:
+  cloud_provider-data:
