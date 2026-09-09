@@ -1,64 +1,53 @@
 package domain
 
-import (
-	"math"
-)
+type SegmentTree struct {
+	Tree      *MerkleTree
+	MaxLeaves int
+	Sealed    bool
+}
 
 // initiate a new MerkleTree
-func NewMerkleTree(maxLeaves int) *SegmentTree {
+func NewSegmentTree(maxLeaves int) *SegmentTree {
+	merkleT := NewMerkleTree()
+
 	tree := &SegmentTree{
-		Nodes:     make([][]SegmentNode, 1),
+		Tree:      merkleT,
 		MaxLeaves: maxLeaves,
 		Sealed:    false,
 	}
-	tree.Nodes[0] = make([]SegmentNode, 0, tree.MaxLeaves)
+	merkleT.Nodes[0] = make([]MerkleNode, 0, tree.MaxLeaves)
 	return tree
 }
 
 // Insert a log into a mutable tree
-func (tree *SegmentTree) InsertLog(h [32]byte) {
+func (tree *SegmentTree) Append(h [32]byte) {
+	merkleT := tree.Tree
 	//if sealed then cannot append
 	if tree.Sealed {
 		return
 	}
 
-	if len(tree.Nodes[0]) >= tree.MaxLeaves {
+	if merkleT.LeafCount() >= tree.MaxLeaves {
 		return
 	}
-	tree.Nodes[0] = append(tree.Nodes[0], SegmentNode{Hash: h})
+	merkleT.AddLeaf(h)
 }
 
 // Build immutable segment tree
-func (tree *SegmentTree) BuildSegmentTree() [32]byte {
-	numNodes := len(tree.Nodes[0])
-	levels := int(math.Ceil(math.Log2(float64(numNodes))))
-	for l := range levels {
-		tree.Nodes = append(tree.Nodes, make([]SegmentNode, 0))
-		for i := 0; i < numNodes; i = i + 2 {
-			if i+1 >= numNodes {
-				break
-			}
-
-			tree.Nodes[l+1] = append(tree.Nodes[l+1], SegmentNode{
-				Hash: HashPair(
-					&tree.Nodes[l][i].Hash,
-					&tree.Nodes[l][i+1].Hash),
-			})
-		}
-
-		//exist a left Nodes with no right sib
-		if numNodes%2 != 0 {
-			tree.Nodes[l+1] = append(tree.Nodes[l+1], SegmentNode{
-				Hash: tree.Nodes[l][numNodes-1].Hash,
-			})
-		}
-		numNodes = len(tree.Nodes[l+1])
+func (tree *SegmentTree) BuildSegmentTree() ([32]byte, bool) {
+	if !tree.Sealed {
+		return [32]byte{}, false
 	}
 
-	//return rootHash
-	return tree.Nodes[len(tree.Nodes)-1][0].Hash
+	root, ok := tree.Tree.BuildTree()
+	if !ok {
+		return [32]byte{}, false
+	}
+
+	tree.Tree.Root = root
+	return root, true
 }
 
-func (tree *SegmentTree) Seal() {
-	tree.Sealed = true
+func (merkleT *SegmentTree) Seal() {
+	merkleT.Sealed = true
 }
