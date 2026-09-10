@@ -8,13 +8,21 @@ services:
      - cassandra-data:/var/lib/cassandra
 
   postgresql:
-    image: postgresql:latest
-    container_name: cloud_provider
+    image: postgresql:17
+    container_name: hmf-postgres
+    
+    environment:
+      POSTGRES_USER: hmf
+      POSTGRES_PASSWORD: hmfdev
+      POSTGRES_DB: cloud_provider
+
     ports:
     - "5432:5432"
+
     volumes:
-    - cloud_provider-data:/var/lib/postgresql
+    - postgres-data:/var/lib/postgresql/data
+    - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
 
 volumes:
   cassandra-data:
-  cloud_provider-data:
+  postgres-data:
