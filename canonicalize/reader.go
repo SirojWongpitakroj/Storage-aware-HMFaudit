@@ -33,6 +33,9 @@ func (r *DatasetReader) Next() bool {
 
 		r.parse(logBytes)
 
+		//add logical attr to AD
+		r.CurrLog.AD = domain.EncodeAD(r.CurrLog)
+
 		r.encrypt(logBytes)
 	} else {
 		r.file.Close()

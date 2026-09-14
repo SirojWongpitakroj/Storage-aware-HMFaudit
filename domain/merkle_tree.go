@@ -123,14 +123,3 @@ func (tree *MerkleTree) UpdateRoot(index int) bool {
 	tree.Root = currHash
 	return true
 }
-
-//simulator locator. Will be remove later
-func (tree *MerkleTree) Locate(h [32]byte) int {
-	for i, node := range tree.Nodes[0] {
-		if node.Hash == h {
-			return i
-		}
-	}
-
-	return -1
-}

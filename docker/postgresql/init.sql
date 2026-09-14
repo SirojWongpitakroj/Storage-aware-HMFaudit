@@ -16,11 +16,11 @@
 -- );
 
 CREATE TABLE encrypted_logs (
-    provider_id BIGSERIAL PRIMARY KEY
-    log_id UUID UNIQUE KEY,
+    provider_id BIGSERIAL PRIMARY KEY,
+    log_id UUID UNIQUE NOT NULL,
     ciphertext BYTEA NOT NULL,
     nonce BYTEA NOT NULL,
-    auth_tag BYTEA,
+    auth_tag BYTEA NOT NULL,
     associated_data BYTEA,
-    created_at TIMESTAMPTZ NOT NULL
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
