@@ -33,9 +33,9 @@ func (r *DatasetReader) encrypt(logBytes []byte) error {
 	}
 
 	//construct AD
-	ad := fmt.Sprintf("region=%s,tenant=%s,service=%s,logtype=%s,time=%s,nonce=%x",
-		r.CurrLog.RegionID, r.CurrLog.TenantID, r.CurrLog.ServiceID,
-		r.CurrLog.LogType, r.CurrLog.EventTime.String(), nonce)
+	ad := fmt.Sprintf("logid=%v,region=%s,tenant=%s,service=%s,logtype=%s,time=%s,nonce=%x",
+		r.CurrLog.LogID, r.CurrLog.RegionID, r.CurrLog.TenantID,
+		r.CurrLog.ServiceID, r.CurrLog.LogType, r.CurrLog.EventTime.String(), nonce)
 
 	encrypted := aesGCM.Seal(nil, nonce, logBytes, []byte(ad))
 

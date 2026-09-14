@@ -1,8 +1,13 @@
 package domain
 
-import "time"
+import (
+	"time"
+	"uuid"
+)
 
 type Log struct {
+	LogID uuid.UUID `json:"logID"`
+
 	EventTime time.Time `json:"event_time"`
 	RegionID  string    `json:"region_id"`
 	TenantID  string    `json:"tenant_id"`
@@ -12,4 +17,5 @@ type Log struct {
 	Ciphertext []byte
 	Tag        []byte
 	nonce      []byte
+	digest     [32]byte
 }
