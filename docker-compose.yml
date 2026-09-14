@@ -1,0 +1,49 @@
+services:
+  cassandra:
+    image: cassandra:5.0.9
+    container_name: hmf-cassandra
+    ports:
+     - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: hmf-cluster
+      CASSANDRA_DC: datacenter1
+    volumes:
+     - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  cassandra-init:
+    image: cassandra:5.0.9
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./docker/cassandra/init.cql:/init.cql:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        cqlsh cassandra 9042 -f /init.cql
+
+  postgresql:
+    image: postgres:17
+    container_name: hmf-postgres
+    
+    environment:
+      POSTGRES_USER: hmf
+      POSTGRES_PASSWORD: hmfdev
+      POSTGRES_DB: cloud_provider
+
+    ports:
+    - "5432:5432"
+
+    volumes:
+    - postgres-data:/var/lib/postgresql/data
+    - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  cassandra-data:
+  postgres-data:
