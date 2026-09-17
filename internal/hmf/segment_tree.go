@@ -19,8 +19,8 @@ type builder struct {
 	levels [][]MerkleNode
 }
 
-// initiate a new MerkleTree
-func NewSegmentTree(regionID string, shardID, segmentID, maxLeaves int) *SegmentTree {
+// NewSegmentTree initiate a new MerkleTree
+func NewSegmentTree(regionID string, shardID, segmentID int64, maxLeaves int) *SegmentTree {
 	tree := &SegmentTree{
 		MerkleTree: &MerkleTree{
 			TreeID: TreeID{
@@ -42,7 +42,7 @@ func NewSegmentTree(regionID string, shardID, segmentID, maxLeaves int) *Segment
 	return tree
 }
 
-// Insert a log into a mutable tree 2^15
+// Append inserts a log into the mutable tree.
 func (tree *SegmentTree) Append(h [32]byte) error {
 	if tree.Sealed {
 		return fmt.Errorf("append segment tree: segment tree sealed")
@@ -61,7 +61,7 @@ func (tree *SegmentTree) Append(h [32]byte) error {
 // Build immutable segment tree
 func (tree *SegmentTree) buildInternalNode() {
 	for l := 1; l < 15; l++ { //start at first internal level and exclude root level
-		for i := 1; i < tree.LeafCount; i = i + 2 {
+		for i := int64(1); i < tree.LeafCount; i = i + 2 {
 			parentIdx := i / 2
 			combinedHash := domain.HashPair(
 				"NODE",
@@ -79,7 +79,7 @@ func (tree *SegmentTree) buildInternalNode() {
 		if len(tree.levels[l-1])%2 == 1 {
 			tree.levels[l] = append(tree.levels[l], MerkleNode{
 				Level: l,
-				Index: (len(tree.levels[l-1]) - 1) / 2,
+				Index: int64((len(tree.levels[l-1]) - 1) / 2),
 				Hash:  tree.levels[l-1][len(tree.levels[l-1])-1].Hash,
 			})
 		}

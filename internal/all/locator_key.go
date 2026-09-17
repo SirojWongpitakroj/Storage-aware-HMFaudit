@@ -1,11 +1,12 @@
-package domain
+// Package all implements Authenticated Log Locator
+package all
 
 import (
 	"bytes"
 	"encoding/binary"
 )
 
-// compare lexicographically (Tenant, Service, LogType, Region, Timestamp)
+// Less fn compares lexicographically (Tenant, Service, LogType, Region, Timestamp)
 func (key *LocatorKey) Less(other LocatorKey) bool {
 	if key.TenantID != other.TenantID {
 		return key.TenantID < other.TenantID
@@ -44,6 +45,23 @@ func encodeKey(key LocatorKey) []byte {
 	)
 
 	buf.Write(key.LogID[:])
+
+	return buf.Bytes()
+}
+
+func encodeValue(value *LocatorValue) []byte {
+	var buf bytes.Buffer
+
+	if value == nil {
+		buf.WriteByte(0)
+		return buf.Bytes()
+	}
+
+	buf.WriteByte(1)
+	writeString(&buf, value.RegionID)
+	writeString(&buf, value.ShardID)
+	writeString(&buf, value.SegmentID)
+	writeString(&buf, value.LeafID)
 
 	return buf.Bytes()
 }

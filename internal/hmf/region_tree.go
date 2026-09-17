@@ -26,7 +26,7 @@ func NewRegionTree(regionID string, numShards int) *RegionTree {
 				Type:     TreeRegion,
 				RegionID: regionID,
 			},
-			LeafCount: numShards,
+			LeafCount: int64(numShards),
 			Height:    treeHeight,
 		},
 		levels:    make([][]MerkleNode, treeHeight+1),
@@ -52,7 +52,7 @@ func (tree *RegionTree) Build(shardHashes [][32]byte) ([]MerkleNode, error) {
 	for i, h := range shardHashes {
 		leaf := MerkleNode{
 			Level: 0,
-			Index: i,
+			Index: int64(i),
 			Hash:  h,
 		}
 		tree.levels[0][i] = leaf
@@ -66,7 +66,7 @@ func (tree *RegionTree) Build(shardHashes [][32]byte) ([]MerkleNode, error) {
 			rightIndex := leftIndex + 1
 			internalNode := MerkleNode{
 				Level: l,
-				Index: parentIndex,
+				Index: int64(parentIndex),
 				Hash:  tree.levels[l-1][leftIndex].Hash,
 			}
 			if rightIndex < len(tree.levels[l-1]) {
@@ -85,10 +85,10 @@ func (tree *RegionTree) Build(shardHashes [][32]byte) ([]MerkleNode, error) {
 }
 
 func (tree *RegionTree) recomputePath(shardIndex int, updates []MerkleNode) ([]MerkleNode, error) {
-	if shardIndex < 0 || shardIndex >= tree.LeafCount {
+	if shardIndex < 0 || int64(shardIndex) >= tree.LeafCount {
 		return updates, fmt.Errorf("recompute region path: shard index %d out of range", shardIndex)
 	}
-	if len(tree.levels) != tree.Height+1 || len(tree.levels[0]) != tree.LeafCount {
+	if len(tree.levels) != tree.Height+1 || int64(len(tree.levels[0])) != tree.LeafCount {
 		return updates, fmt.Errorf("recompute region path: invalid in-memory tree layout")
 	}
 
@@ -105,7 +105,7 @@ func (tree *RegionTree) recomputePath(shardIndex int, updates []MerkleNode) ([]M
 
 		parent := MerkleNode{
 			Level: level,
-			Index: parentIndex,
+			Index: int64(parentIndex),
 			Hash:  childLevel[leftIndex].Hash,
 		}
 		if rightIndex < len(childLevel) {
@@ -134,7 +134,7 @@ func (tree *RegionTree) updateShardRoot(shardIndex int, shardRoot [32]byte) ([]M
 	//update shard root
 	leaf := MerkleNode{
 		Level: 0,
-		Index: shardIndex,
+		Index: int64(shardIndex),
 		Hash:  shardRoot,
 	}
 	tree.levels[0][shardIndex] = leaf

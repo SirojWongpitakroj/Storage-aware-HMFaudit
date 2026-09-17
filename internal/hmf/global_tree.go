@@ -25,7 +25,7 @@ func NewGlobalTree(numRegions int) *GlobalTree {
 			TreeID: TreeID{
 				Type: TreeGlobal,
 			},
-			LeafCount: numRegions,
+			LeafCount: int64(numRegions),
 			Height:    treeHeight,
 		},
 		levels:     make([][]MerkleNode, treeHeight+1),
@@ -49,7 +49,7 @@ func (tree *GlobalTree) Build(regionHashes [][32]byte) ([]MerkleNode, error) {
 	for index, hash := range regionHashes {
 		leaf := MerkleNode{
 			Level: 0,
-			Index: index,
+			Index: int64(index),
 			Hash:  hash,
 		}
 		tree.levels[0][index] = leaf
@@ -62,7 +62,7 @@ func (tree *GlobalTree) Build(regionHashes [][32]byte) ([]MerkleNode, error) {
 			rightIndex := leftIndex + 1
 			parent := MerkleNode{
 				Level: level,
-				Index: parentIndex,
+				Index: int64(parentIndex),
 				Hash:  tree.levels[level-1][leftIndex].Hash,
 			}
 			if rightIndex < len(tree.levels[level-1]) {
@@ -95,7 +95,7 @@ func (tree *GlobalTree) recomputePath(regionIndex int, updates []MerkleNode) ([]
 
 		parent := MerkleNode{
 			Level: level,
-			Index: parentIndex,
+			Index: int64(parentIndex),
 			Hash:  children[leftIndex].Hash,
 		}
 		if rightIndex < len(children) {
@@ -122,7 +122,7 @@ func (tree *GlobalTree) updateRegionRoot(regionIndex int, regionRoot [32]byte) (
 
 	leaf := MerkleNode{
 		Level: 0,
-		Index: regionIndex,
+		Index: int64(regionIndex),
 		Hash:  regionRoot,
 	}
 	tree.levels[0][regionIndex] = leaf

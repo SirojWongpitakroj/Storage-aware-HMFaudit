@@ -1,6 +1,24 @@
-package domain
+package all
 
 import "crypto/sha256"
+
+//Page struct
+type Page struct {
+	PageID int64
+	Hash   [32]byte
+
+	IsLeaf bool
+	Keys   []LocatorKey
+
+	Parent *Page
+
+	//used by leaf pages
+	Values []*LocatorValue
+	Next   *Page
+
+	//used by internal pages
+	Children []*Page
+}
 
 func (page *Page) concatEncKeys(prefix []byte) []byte {
 	for _, key := range page.Keys {
@@ -30,7 +48,10 @@ func (page *Page) findKeyIdx(currKey LocatorKey) int {
 
 func (page *Page) leafHash() [32]byte {
 	concatLeaf := []byte("LEAF")
-	concatLeaf = page.concatEncKeys(concatLeaf)
+	for index, key := range page.Keys {
+		concatLeaf = append(concatLeaf, encodeKey(key)...)
+		concatLeaf = append(concatLeaf, encodeValue(page.Values[index])...)
+	}
 	return sha256.Sum256(concatLeaf)
 }
 

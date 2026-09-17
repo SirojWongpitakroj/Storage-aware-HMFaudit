@@ -1,3 +1,4 @@
+// Package hmf implements hierarchical Merkle trees.
 package hmf
 
 import (
@@ -23,8 +24,9 @@ func (tree *ShardTree) popFrontier() (MerkleNode, error) {
 	return poppedNode, nil
 }
 
-// main function
-func NewShardTree(regionID string, shardID int) *ShardTree {
+// Main function
+
+func NewShardTree(regionID string, shardID int64) *ShardTree {
 	tree := ShardTree{
 		MerkleTree: &MerkleTree{
 			TreeID: TreeID{
@@ -101,19 +103,21 @@ func (tree *ShardTree) materializeRootPath(updates []MerkleNode) ([]MerkleNode, 
 	return updates, right, nil
 }
 
-func (tree *ShardTree) Append(segmentHash [32]byte) error {
+func (tree *ShardTree) Append(segmentHash [32]byte) ([]MerkleNode, error) {
 	updates, err := tree.mergeFrontier(segmentHash)
 	if err != nil {
-		return err
+		return updates, err
 	}
 
 	updates, shardRoot, err := tree.materializeRootPath(updates)
 	if err != nil {
-		return err
+		return updates, err
 	}
+
+	//TODO: Updates Nodes in Path
 
 	tree.Root = shardRoot.Hash
 	tree.LeafCount++
 	tree.Height = shardRoot.Level
-	return nil
+	return updates, err
 }

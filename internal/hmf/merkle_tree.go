@@ -12,19 +12,19 @@ const (
 type TreeID struct {
 	Type      TreeType
 	RegionID  string
-	ShardID   int
-	SegmentID int
+	ShardID   int64
+	SegmentID int64
 }
 
 type MerkleNode struct {
 	Level int
-	Index int
+	Index int64
 	Hash  [32]byte
 }
 
 type MerkleTree struct {
 	TreeID    TreeID
 	Root      [32]byte
-	LeafCount int
+	LeafCount int64
 	Height    int
 }

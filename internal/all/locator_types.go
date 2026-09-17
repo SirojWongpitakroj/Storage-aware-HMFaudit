@@ -1,4 +1,4 @@
-package domain
+package all
 
 import (
 	"time"
@@ -6,6 +6,7 @@ import (
 )
 
 // tree struct
+
 type LocatorKey struct {
 	LogID uuid.UUID
 
@@ -24,31 +25,13 @@ type LocatorValue struct {
 }
 
 type LocatorTree struct {
-	RootPageID uint64
-	NextPageID uint64
+	RootPageID int64
+	NextPageID int64
 	RootHash   [32]byte
 	RootPage   *Page
 
 	Height    int
-	LeafCount int
+	LeafCount int64
 
 	Order int //m: max children per internal page
-}
-
-// page struct
-type Page struct {
-	PageID uint64
-	Hash   [32]byte
-
-	IsLeaf bool
-	Keys   []LocatorKey
-
-	Parent *Page
-
-	//used by leaf pages
-	Values []*LocatorValue
-	Next   *Page
-
-	//used by internal pages
-	Children []*Page
 }
