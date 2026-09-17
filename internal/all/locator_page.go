@@ -2,7 +2,7 @@ package all
 
 import "crypto/sha256"
 
-//Page struct
+// Page struct
 type Page struct {
 	PageID int64
 	Hash   [32]byte
@@ -10,7 +10,8 @@ type Page struct {
 	IsLeaf bool
 	Keys   []LocatorKey
 
-	Parent *Page
+	Parent       *Page
+	ParentPageID *int64
 
 	//used by leaf pages
 	Values []*LocatorValue

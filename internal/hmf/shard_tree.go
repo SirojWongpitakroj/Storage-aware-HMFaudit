@@ -4,23 +4,23 @@ package hmf
 import (
 	"fmt"
 
-	"github.com/SirojWongpitakroj/hmf-audit/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 )
 
 type ShardTree struct {
 	*MerkleTree
-	Frontiers []MerkleNode
+	frontiers []MerkleNode
 }
 
 func (tree *ShardTree) popFrontier() (MerkleNode, error) {
-	frontierLen := len(tree.Frontiers)
+	frontierLen := len(tree.frontiers)
 	if frontierLen == 0 {
 		return MerkleNode{},
 			fmt.Errorf("pop frontier node: do not have MerkleNode to pop")
 	}
 
-	poppedNode := tree.Frontiers[frontierLen-1]
-	tree.Frontiers = tree.Frontiers[:frontierLen-1]
+	poppedNode := tree.frontiers[frontierLen-1]
+	tree.frontiers = tree.frontiers[:frontierLen-1]
 	return poppedNode, nil
 }
 
@@ -35,7 +35,7 @@ func NewShardTree(regionID string, shardID int64) *ShardTree {
 				ShardID:  shardID,
 			},
 		},
-		Frontiers: make([]MerkleNode, 0),
+		frontiers: make([]MerkleNode, 0),
 	}
 	return &tree
 }
@@ -50,8 +50,8 @@ func (tree *ShardTree) mergeFrontier(segmentHash [32]byte) ([]MerkleNode, error)
 
 	updates := []MerkleNode{currNode}
 
-	for len(tree.Frontiers) > 0 &&
-		tree.Frontiers[len(tree.Frontiers)-1].Level == currNode.Level {
+	for len(tree.frontiers) > 0 &&
+		tree.frontiers[len(tree.frontiers)-1].Level == currNode.Level {
 
 		left, err := tree.popFrontier()
 		if err != nil {
@@ -65,22 +65,22 @@ func (tree *ShardTree) mergeFrontier(segmentHash [32]byte) ([]MerkleNode, error)
 		}
 		updates = append(updates, currNode)
 	}
-	tree.Frontiers = append(tree.Frontiers, currNode)
+	tree.frontiers = append(tree.frontiers, currNode)
 
 	return updates, nil
 }
 
 func (tree *ShardTree) materializeRootPath(updates []MerkleNode) ([]MerkleNode, MerkleNode, error) {
-	if len(tree.Frontiers) <= 0 {
+	if len(tree.frontiers) <= 0 {
 		return updates, MerkleNode{}, fmt.Errorf("update shard root path error: no node in frontier")
 	}
-	if len(tree.Frontiers) <= 1 {
-		return updates, tree.Frontiers[0], nil
+	if len(tree.frontiers) <= 1 {
+		return updates, tree.frontiers[0], nil
 	}
 
-	right := tree.Frontiers[len(tree.Frontiers)-1]
-	for i := len(tree.Frontiers) - 2; i >= 0; i-- {
-		left := tree.Frontiers[i]
+	right := tree.frontiers[len(tree.frontiers)-1]
+	for i := len(tree.frontiers) - 2; i >= 0; i-- {
+		left := tree.frontiers[i]
 		//recusively promote
 		for right.Level < left.Level {
 			right = MerkleNode{

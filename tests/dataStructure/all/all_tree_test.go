@@ -107,8 +107,12 @@ func TestLocatorTreeInsertMaintainsSortedKeyValuePairs(t *testing.T) {
 
 func TestLocatorTreeLeafSplitCreatesInternalRoot(t *testing.T) {
 	tree := locator.NewLocatorTree(4)
+	var updates []locator.Page
 	for index := 4; index >= 0; index-- {
-		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+		insertUpdates := tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+		if index == 1 {
+			updates = insertUpdates
+		}
 	}
 
 	if tree.RootPage.IsLeaf {
@@ -131,6 +135,16 @@ func TestLocatorTreeLeafSplitCreatesInternalRoot(t *testing.T) {
 	}
 	if len(tree.RootPage.Keys) != 1 || tree.RootPage.Keys[0] != right.Keys[0] {
 		t.Fatal("root separator is not the first key of the right leaf")
+	}
+
+	updateIDs := make(map[int64]bool, len(updates))
+	for _, page := range updates {
+		updateIDs[page.PageID] = true
+	}
+	for _, page := range []*locator.Page{tree.RootPage, left, right} {
+		if !updateIDs[page.PageID] {
+			t.Fatalf("split update does not include page %d", page.PageID)
+		}
 	}
 
 	assertLocatorTree(t, tree, 5)

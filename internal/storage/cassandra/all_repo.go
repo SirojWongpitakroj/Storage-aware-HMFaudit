@@ -160,6 +160,18 @@ func (r *ALLRepo) UpsertPages(ctx context.Context, pages []ALLPage) error {
 	return nil
 }
 
+// SaveLocatorUpdate persists changed pages before publishing their resulting
+// root state. Callers must provide pages and state from the same ALL update.
+func (r *ALLRepo) SaveLocatorUpdate(ctx context.Context, pages []ALLPage, state ALLTreeState) error {
+	if err := r.UpsertPages(ctx, pages); err != nil {
+		return fmt.Errorf("save locator update pages: %w", err)
+	}
+	if err := r.UpsertTreeState(ctx, state); err != nil {
+		return fmt.Errorf("save locator update state: %w", err)
+	}
+	return nil
+}
+
 func (r *ALLRepo) GetPage(ctx context.Context, treeID string,
 	pageID int64, pagesPerBucket int64) (ALLPage, error) {
 

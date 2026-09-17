@@ -5,7 +5,7 @@ import (
 	"math/bits"
 	"testing"
 
-	"github.com/SirojWongpitakroj/hmf-audit/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 )
 
@@ -29,6 +29,26 @@ func TestSegmentTreeAppendTracksLeafCount(t *testing.T) {
 	tree.Sealed = true
 	if err := tree.Append(testHash("after-seal")); err == nil {
 		t.Fatal("append to a sealed segment succeeded")
+	}
+}
+
+func TestSegmentTreeSealReturnsAllNodesForPersistence(t *testing.T) {
+	tree := hmf.NewSegmentTree("R1", 2, 3, 4)
+	for _, value := range []string{"log-1", "log-2", "log-3"} {
+		if err := tree.Append(testHash(value)); err != nil {
+			t.Fatalf("append %s: %v", value, err)
+		}
+	}
+
+	updates, err := tree.Seal()
+	if err != nil {
+		t.Fatalf("seal segment tree: %v", err)
+	}
+	if len(updates) != merkleNodeCount(3) {
+		t.Fatalf("update count = %d, want %d", len(updates), merkleNodeCount(3))
+	}
+	if updates[len(updates)-1].Hash != tree.Root {
+		t.Fatalf("last update is not root: %x, want %x", updates[len(updates)-1].Hash, tree.Root)
 	}
 }
 

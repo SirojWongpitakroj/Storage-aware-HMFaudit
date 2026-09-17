@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/SirojWongpitakroj/hmf-audit/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 )
 
 type GlobalTree struct {
@@ -115,7 +115,7 @@ func (tree *GlobalTree) recomputePath(regionIndex int, updates []MerkleNode) ([]
 	return updates, nil
 }
 
-func (tree *GlobalTree) updateRegionRoot(regionIndex int, regionRoot [32]byte) ([]MerkleNode, error) {
+func (tree *GlobalTree) UpdateRegionRoot(regionIndex int, regionRoot [32]byte) ([]MerkleNode, error) {
 	if regionIndex < 0 || regionIndex >= tree.numRegions {
 		return nil, fmt.Errorf("update global tree: region index %d out of range", regionIndex)
 	}

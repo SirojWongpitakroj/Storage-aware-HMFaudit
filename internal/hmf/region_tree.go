@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/SirojWongpitakroj/hmf-audit/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 )
 
 type RegionTree struct {

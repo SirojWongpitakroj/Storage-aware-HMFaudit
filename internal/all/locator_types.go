@@ -35,3 +35,14 @@ type LocatorTree struct {
 
 	Order int //m: max children per internal page
 }
+
+// LocatorUpdate contains the final ALL state changed by one insertion.
+type LocatorUpdate struct {
+	Pages []Page
+
+	RootPageID  int64
+	RootHash    [32]byte
+	NextPageID  int64
+	Height      int
+	RecordCount int64
+}

@@ -5,14 +5,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
-	cassandrastore "github.com/SirojWongpitakroj/hmf-audit/storage/cassandra"
+	cassandrastore "github.com/SirojWongpitakroj/hmf-audit/internal/storage/cassandra"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
 
 func TestCassandraRepositories(t *testing.T) {
+	if os.Getenv("HMF_AUDIT_INTEGRATION") != "1" {
+		t.Skip("set HMF_AUDIT_INTEGRATION=1 after starting Cassandra to run integration tests")
+	}
+
 	session := newCassandraSession(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

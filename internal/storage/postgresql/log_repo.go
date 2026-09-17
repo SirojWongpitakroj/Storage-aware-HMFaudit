@@ -4,7 +4,7 @@ import (
 	"context"
 	"uuid"
 
-	"github.com/SirojWongpitakroj/hmf-audit/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
