@@ -60,6 +60,44 @@ func (r *ShardRepo) UpsertFrontiers(ctx context.Context, regionID string,
 	return nil
 }
 
+// ReplaceFrontiers replaces every frontier row for one shard with one snapshot.
+func (r *ShardRepo) ReplaceFrontiers(ctx context.Context, regionID string,
+	shardID int64, frontiers []ShardFrontier) error {
+
+	batch := r.session.Batch(gocql.LoggedBatch)
+	batch = batch.Query(`
+		DELETE FROM shard_tree_frontiers
+		WHERE region_id = ? AND shard_id = ?;
+	`, regionID, shardID)
+
+	query := `
+		INSERT INTO shard_tree_frontiers (
+			region_id,
+			shard_id,
+			level,
+			node_index,
+			node_hash
+		)
+		VALUES (?, ?, ?, ?, ?);
+	`
+	for _, frontier := range frontiers {
+		batch = batch.Query(
+			query,
+			regionID,
+			shardID,
+			frontier.Level,
+			frontier.NodeIndex,
+			frontier.NodeHash,
+		)
+	}
+
+	if err := batch.ExecContext(ctx); err != nil {
+		return fmt.Errorf("replace shard frontiers: %w", err)
+	}
+
+	return nil
+}
+
 // GetFrontiers returns every persisted frontier row for one shard.
 func (r *ShardRepo) GetFrontiers(ctx context.Context, regionID string,
 	shardID int64) ([]ShardFrontier, error) {

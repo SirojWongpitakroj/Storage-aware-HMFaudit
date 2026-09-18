@@ -169,7 +169,6 @@ CREATE TABLE IF NOT EXISTS hmf_segments_by_shard ( --query segment root by shard
     sealed           boolean,
     created_at       timestamp,
     sealed_at        timestamp,
-    updated_at       timestamp,
 
     PRIMARY KEY ((region_id, shard_id), segment_id)
 )

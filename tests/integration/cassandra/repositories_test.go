@@ -226,7 +226,6 @@ func testSegmentRepo(t *testing.T, session *gocql.Session) {
 		Sealed:         true,
 		CreatedAt:      startTS,
 		SealedAt:       &sealedAt,
-		UpdatedAt:      now,
 	}
 
 	if err := repo.UpsertSegment(ctx, segment); err != nil {

@@ -40,6 +40,11 @@ func NewShardTree(regionID string, shardID int64) *ShardTree {
 	return &tree
 }
 
+// Frontiers returns a copy of the current append frontier for persistence.
+func (tree *ShardTree) Frontiers() []MerkleNode {
+	return append([]MerkleNode(nil), tree.frontiers...)
+}
+
 // get node to update and get new frontierNode
 func (tree *ShardTree) mergeFrontier(segmentHash [32]byte) ([]MerkleNode, error) {
 	currNode := MerkleNode{

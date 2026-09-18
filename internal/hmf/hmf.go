@@ -2,6 +2,7 @@ package hmf
 
 import (
 	"fmt"
+	"time"
 )
 
 type HMFConfig struct {
@@ -12,18 +13,39 @@ type HMFConfig struct {
 
 // HMFUpdate contains every hierarchy node changed when a segment is sealed.
 type HMFUpdate struct {
-	SegmentTreeID TreeID
-	SegmentNodes  []MerkleNode
+	SegmentTreeID    TreeID
+	SegmentNodes     []MerkleNode
+	SegmentRoot      [32]byte
+	SegmentLeaves    int64
+	SegmentHeight    int
+	ShardLeafIndex   int64
+	SegmentMaxLeaves int
+	SegmentMaxAge    time.Duration
+	SegmentCreatedAt time.Time
+	SegmentStartedAt time.Time
+	SegmentEndedAt   time.Time
+	SegmentSealedAt  time.Time
 
-	ShardTreeID TreeID
-	ShardNodes  []MerkleNode
+	ShardTreeID    TreeID
+	ShardNodes     []MerkleNode
+	ShardRoot      [32]byte
+	ShardLeaves    int64
+	ShardHeight    int
+	ShardFrontiers []MerkleNode
 
-	RegionTreeID TreeID
-	RegionNodes  []MerkleNode
+	RegionTreeID          TreeID
+	RegionNodes           []MerkleNode
+	RegionRoot            [32]byte
+	RegionLeaves          int64
+	RegionHeight          int
+	RegionParentLeafIndex int64
 
-	GlobalTreeID TreeID
-	GlobalNodes  []MerkleNode
-	GlobalRoot   [32]byte
+	GlobalTreeID          TreeID
+	GlobalNodes           []MerkleNode
+	GlobalRoot            [32]byte
+	GlobalLeaves          int64
+	GlobalHeight          int
+	GlobalParentLeafIndex int64
 }
 
 // HMF coordinates the in-memory trees that make up one hierarchy.
@@ -88,4 +110,62 @@ func NewHMF(config HMFConfig) (*HMF, error) {
 
 func (forest *HMF) Root() [32]byte {
 	return forest.GlobalTree.Root
+}
+
+// AppendSealedSegment adds a sealed Segment root to its Shard and propagates
+// the resulting root through the Region and Global trees.
+func (forest *HMF) AppendSealedSegment(regionID string, shardID int64, segmentRoot [32]byte) (HMFUpdate, error) {
+	shardTreeID := TreeID{
+		Type:     TreeShard,
+		RegionID: regionID,
+		ShardID:  shardID,
+	}
+	shardTree, exists := forest.ShardTrees[shardTreeID]
+	if !exists {
+		return HMFUpdate{}, fmt.Errorf("append sealed segment: shard %d does not exist in region %s", shardID, regionID)
+	}
+
+	shardLeafIndex := shardTree.LeafCount
+	shardNodes, err := shardTree.Append(segmentRoot)
+	if err != nil {
+		return HMFUpdate{}, err
+	}
+
+	regionTree, exists := forest.RegionTrees[regionID]
+	if !exists {
+		return HMFUpdate{}, fmt.Errorf("append sealed segment: region %s does not exist", regionID)
+	}
+	shardIndex := forest.shardIndexes[shardTreeID]
+	regionNodes, err := regionTree.updateShardRoot(shardIndex, shardTree.Root)
+	if err != nil {
+		return HMFUpdate{}, err
+	}
+
+	regionIndex := forest.regionIndexes[regionID]
+	globalNodes, err := forest.GlobalTree.UpdateRegionRoot(regionIndex, regionTree.Root)
+	if err != nil {
+		return HMFUpdate{}, err
+	}
+
+	return HMFUpdate{
+		ShardTreeID:           shardTreeID,
+		ShardNodes:            shardNodes,
+		ShardRoot:             shardTree.Root,
+		ShardLeaves:           shardTree.LeafCount,
+		ShardHeight:           shardTree.Height,
+		ShardFrontiers:        shardTree.Frontiers(),
+		ShardLeafIndex:        shardLeafIndex,
+		RegionTreeID:          regionTree.TreeID,
+		RegionNodes:           regionNodes,
+		RegionRoot:            regionTree.Root,
+		RegionLeaves:          regionTree.LeafCount,
+		RegionHeight:          regionTree.Height,
+		RegionParentLeafIndex: int64(shardIndex),
+		GlobalTreeID:          forest.GlobalTree.TreeID,
+		GlobalNodes:           globalNodes,
+		GlobalRoot:            forest.GlobalTree.Root,
+		GlobalLeaves:          forest.GlobalTree.LeafCount,
+		GlobalHeight:          forest.GlobalTree.Height,
+		GlobalParentLeafIndex: int64(regionIndex),
+	}, nil
 }

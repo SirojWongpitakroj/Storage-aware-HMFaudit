@@ -31,7 +31,6 @@ type SegmentMetadata struct {
 	Sealed         bool
 	CreatedAt      time.Time
 	SealedAt       *time.Time
-	UpdatedAt      time.Time
 }
 
 type SegmentRepo struct {
@@ -194,10 +193,9 @@ func (r *SegmentRepo) UpsertSegment(ctx context.Context, segment SegmentMetadata
 			end_ts,
 			sealed,
 			created_at,
-			sealed_at,
-			updated_at
+			sealed_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 
 	err := r.session.Query(
@@ -215,7 +213,6 @@ func (r *SegmentRepo) UpsertSegment(ctx context.Context, segment SegmentMetadata
 		segment.Sealed,
 		segment.CreatedAt,
 		segment.SealedAt,
-		segment.UpdatedAt,
 	).ExecContext(ctx)
 
 	if err != nil {
@@ -244,8 +241,7 @@ func (r *SegmentRepo) GetSegment(ctx context.Context, regionID string,
 			end_ts,
 			sealed,
 			created_at,
-			sealed_at,
-			updated_at
+			sealed_at
 		FROM hmf_segments_by_shard
 		WHERE region_id = ?
 		AND shard_id = ?
@@ -272,7 +268,6 @@ func (r *SegmentRepo) GetSegment(ctx context.Context, regionID string,
 		&segment.Sealed,
 		&segment.CreatedAt,
 		&segment.SealedAt,
-		&segment.UpdatedAt,
 	)
 
 	if err != nil {
@@ -299,8 +294,7 @@ func (r *SegmentRepo) GetSegments(ctx context.Context, regionID string,
 			end_ts,
 			sealed,
 			created_at,
-			sealed_at,
-			updated_at
+			sealed_at
 		FROM hmf_segments_by_shard
 		WHERE region_id = ?
 		AND shard_id = ?;
@@ -329,7 +323,6 @@ func (r *SegmentRepo) GetSegments(ctx context.Context, regionID string,
 			&segment.Sealed,
 			&segment.CreatedAt,
 			&segment.SealedAt,
-			&segment.UpdatedAt,
 		) {
 			break
 		}
