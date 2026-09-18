@@ -37,6 +37,9 @@ func NewGlobalTree(numRegions int) *GlobalTree {
 		tree.levels[level] = make([]MerkleNode, nodeCount)
 		nodeCount = (nodeCount + 1) / 2
 	}
+	if _, err := tree.Build(make([][32]byte, numRegions)); err != nil {
+		panic(err)
+	}
 	return &tree
 }
 
@@ -104,6 +107,13 @@ func (tree *GlobalTree) recomputePath(regionIndex int, updates []MerkleNode) ([]
 				&children[leftIndex].Hash,
 				&children[rightIndex].Hash,
 			)
+		}
+		siblingIndex := leftIndex
+		if index%2 == 0 {
+			siblingIndex = rightIndex
+		}
+		if siblingIndex < len(children) {
+			updates = append(updates, children[siblingIndex])
 		}
 
 		tree.levels[level][parentIndex] = parent

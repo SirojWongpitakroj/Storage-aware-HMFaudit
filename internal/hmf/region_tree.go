@@ -38,6 +38,9 @@ func NewRegionTree(regionID string, numShards int) *RegionTree {
 		tree.levels[level] = make([]MerkleNode, nodeCount)
 		nodeCount = (nodeCount + 1) / 2
 	}
+	if _, err := tree.Build(make([][32]byte, numShards)); err != nil {
+		panic(err)
+	}
 	return &tree
 }
 
@@ -114,6 +117,13 @@ func (tree *RegionTree) recomputePath(shardIndex int, updates []MerkleNode) ([]M
 				&childLevel[leftIndex].Hash,
 				&childLevel[rightIndex].Hash,
 			)
+		}
+		siblingIndex := leftIndex
+		if index%2 == 0 {
+			siblingIndex = rightIndex
+		}
+		if siblingIndex < len(childLevel) {
+			updates = append(updates, childLevel[siblingIndex])
 		}
 
 		tree.levels[level][parentIndex] = parent

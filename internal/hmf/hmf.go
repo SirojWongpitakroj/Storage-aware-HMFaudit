@@ -104,6 +104,13 @@ func NewHMF(config HMFConfig) (*HMF, error) {
 			forest.shardIndexes[treeID] = shardIndex
 		}
 	}
+	regionRoots := make([][32]byte, len(config.RegionIDs))
+	for regionIndex, regionID := range config.RegionIDs {
+		regionRoots[regionIndex] = forest.RegionTrees[regionID].Root
+	}
+	if _, err := forest.GlobalTree.Build(regionRoots); err != nil {
+		return nil, fmt.Errorf("new HMF: build initial global tree: %w", err)
+	}
 
 	return forest, nil
 }
