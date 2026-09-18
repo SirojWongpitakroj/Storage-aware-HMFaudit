@@ -4,12 +4,19 @@ package hm
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
+	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 )
+
+// LocatorSubmitter accepts logical-to-physical mappings for ALL.
+type LocatorSubmitter interface {
+	Submit(locator.LocatorRequest) error
+}
 
 type activeSegment struct {
 	Tree      *hmf.SegmentTree
@@ -41,6 +48,16 @@ type Manager struct {
 	workerMu sync.Mutex
 	workers  map[hmf.TreeID]*segmentWorker
 	updates  chan hmf.HMFUpdate
+
+	locatorMu sync.RWMutex
+	locator   LocatorSubmitter
+}
+
+// SetALL connects HM to ALL without giving HM access to LocatorTree internals.
+func (hm *Manager) SetALL(locator LocatorSubmitter) {
+	hm.locatorMu.Lock()
+	hm.locator = locator
+	hm.locatorMu.Unlock()
 }
 
 func NewManager(forest *hmf.HMF, maxSegmentLeaves int, segmentDuration time.Duration) (*Manager, error) {
@@ -169,7 +186,7 @@ func (hm *Manager) getOrStartWorker(
 		ShardID:  shardID,
 	}
 
-	if _, exists := hm.ShardTrees[shardTreeID]; !exists {
+	if _, exists := hm.ShardTrees[shardTreeID]; !exists { //does not exist a shard tree
 		return nil, fmt.Errorf(
 			"submit: shard %d does not exist in region %s",
 			shardID,
@@ -180,10 +197,11 @@ func (hm *Manager) getOrStartWorker(
 	hm.workerMu.Lock()
 	defer hm.workerMu.Unlock()
 
-	if worker, exists := hm.workers[shardTreeID]; exists {
+	if worker, exists := hm.workers[shardTreeID]; exists { //is exist then get worker
 		return worker, nil
 	}
 
+	//otherwise set a worker
 	worker := &segmentWorker{
 		requests: make(chan appendRequest, 1024),
 		stop:     make(chan struct{}),
@@ -191,12 +209,12 @@ func (hm *Manager) getOrStartWorker(
 	}
 	hm.workers[shardTreeID] = worker
 
-	go func() {
+	go func() { //run but not block the func
 		hm.runSegmentWorker(regionID, shardID, worker.requests, hm.updates, worker.stop)
-		close(worker.done)
+		close(worker.done) //worker stopped runnning
 
 		hm.workerMu.Lock()
-		if hm.workers[shardTreeID] == worker {
+		if hm.workers[shardTreeID] == worker { //delete worker
 			delete(hm.workers, shardTreeID)
 		}
 		hm.workerMu.Unlock()
@@ -211,17 +229,7 @@ func (hm *Manager) Submit(
 	digest [32]byte,
 	eventTime time.Time,
 ) error {
-	return hm.SubmitContext(context.Background(), regionID, shardID, digest, eventTime)
-}
-
-func (hm *Manager) SubmitContext(
-	ctx context.Context,
-	regionID string,
-	shardID int64,
-	digest [32]byte,
-	eventTime time.Time,
-) error {
-	return hm.SubmitLog(ctx, shardID, domain.Log{
+	return hm.SubmitLog(context.Background(), shardID, domain.Log{
 		RegionID:  regionID,
 		EventTime: eventTime,
 		Digest:    digest,
@@ -242,22 +250,22 @@ func (hm *Manager) SubmitLog(ctx context.Context, shardID int64, log domain.Log)
 		return err
 	}
 
-	result := make(chan error, 1)
+	result := make(chan error, 1) //for ack
 
 	request := appendRequest{
 		Log:    log,
 		Result: result,
 	}
 
-	select {
+	select { //send req to worker
 	case worker.requests <- request:
-	case <-worker.done:
+	case <-worker.done: //denote the woker has stopped
 		return fmt.Errorf("submit: segment worker stopped")
-	case <-ctx.Done():
+	case <-ctx.Done(): //the caller interupt and revoke the call
 		return ctx.Err()
 	}
 
-	select {
+	select { //wait for response from worker
 	case err := <-result:
 		return err
 	case <-worker.done:
@@ -268,13 +276,36 @@ func (hm *Manager) SubmitLog(ctx context.Context, shardID int64, log domain.Log)
 }
 
 func (hm *Manager) propagateToALL(log domain.Log, segment *hmf.SegmentTree, leafID int64) error {
-	// TODO: Create ALL LocatorKey from LogID, TenantID, ServiceID, LogType,
-	// RegionID, and EventTime. Create LocatorValue from RegionID, ShardID,
-	// SegmentID, and leafID. Insert the mapping into ALL and emit LocatorUpdate.
-	return nil
+	if segment == nil {
+		return fmt.Errorf("propagate to ALL: segment is nil")
+	}
+
+	hm.locatorMu.RLock()
+	locatorClient := hm.locator
+	hm.locatorMu.RUnlock()
+	if locatorClient == nil {
+		return fmt.Errorf("propagate to ALL: ALL is not configured")
+	}
+
+	return locatorClient.Submit(locator.LocatorRequest{
+		Key: locator.LocatorKey{
+			LogID:     log.LogID,
+			EventTime: log.EventTime,
+			RegionID:  log.RegionID,
+			TenantID:  log.TenantID,
+			ServiceID: log.ServiceID,
+			LogType:   log.LogType,
+		},
+		Value: locator.LocatorValue{
+			RegionID:  segment.TreeID.RegionID,
+			ShardID:   strconv.FormatInt(segment.TreeID.ShardID, 10),
+			SegmentID: strconv.FormatInt(segment.TreeID.SegmentID, 10),
+			LeafID:    strconv.FormatInt(leafID, 10),
+		},
+	})
 }
 
-func (hm *Manager) Updates() <-chan hmf.HMFUpdate {
+func (hm *Manager) Updates() <-chan hmf.HMFUpdate { //return receive-only channel
 	return hm.updates
 }
 
@@ -292,7 +323,7 @@ func (hm *Manager) StopWorker(ctx context.Context, regionID string, shardID int6
 		return nil
 	}
 
-	select {
+	select { //wait for worker to stop
 	case <-worker.done:
 		return nil
 	case <-ctx.Done():

@@ -187,6 +187,60 @@ func TestLocatorTreeHashAuthenticatesLocatorValue(t *testing.T) {
 	}
 }
 
+func TestPageCodecRoundTrip(t *testing.T) {
+	t.Run("leaf", func(t *testing.T) {
+		page := locator.Page{
+			PageID: 10,
+			IsLeaf: true,
+			Keys:   []locator.LocatorKey{testLocatorKey(1)},
+			Values: []*locator.LocatorValue{testLocatorValue(1)},
+		}
+
+		data, err := locator.MarshalPage(page)
+		if err != nil {
+			t.Fatalf("marshal leaf page: %v", err)
+		}
+		restored, err := locator.UnmarshalPage(data)
+		if err != nil {
+			t.Fatalf("unmarshal leaf page: %v", err)
+		}
+		if !restored.IsLeaf || restored.Keys[0] != page.Keys[0] {
+			t.Fatal("leaf key was not restored")
+		}
+		if restored.Values[0] == nil || *restored.Values[0] != *page.Values[0] {
+			t.Fatal("leaf value was not restored")
+		}
+	})
+
+	t.Run("internal", func(t *testing.T) {
+		page := locator.Page{
+			IsLeaf: false,
+			Keys:   []locator.LocatorKey{testLocatorKey(1)},
+			Children: []*locator.Page{
+				{PageID: 2, Hash: [32]byte{2}},
+				{PageID: 3, Hash: [32]byte{3}},
+			},
+		}
+
+		data, err := locator.MarshalPage(page)
+		if err != nil {
+			t.Fatalf("marshal internal page: %v", err)
+		}
+		restored, err := locator.UnmarshalPage(data)
+		if err != nil {
+			t.Fatalf("unmarshal internal page: %v", err)
+		}
+		if restored.IsLeaf || restored.Keys[0] != page.Keys[0] {
+			t.Fatal("internal key was not restored")
+		}
+		for index, child := range page.Children {
+			if restored.Children[index].PageID != child.PageID || restored.Children[index].Hash != child.Hash {
+				t.Fatalf("child %d was not restored", index)
+			}
+		}
+	})
+}
+
 func assertLocatorTree(t *testing.T, tree *locator.LocatorTree, recordCount int) {
 	t.Helper()
 

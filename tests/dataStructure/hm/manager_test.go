@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hm"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 )
@@ -24,6 +25,7 @@ func TestManagerRotatesFullSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	manager.SetALL(acceptingLocator{})
 
 	now := time.Now().UTC()
 	first := sha256.Sum256([]byte("first"))
@@ -52,4 +54,10 @@ func TestManagerRotatesFullSegment(t *testing.T) {
 	if err := manager.StopWorker(ctx, "R0", 0); err != nil {
 		t.Fatalf("stop worker: %v", err)
 	}
+}
+
+type acceptingLocator struct{}
+
+func (acceptingLocator) Submit(locator.LocatorRequest) error {
+	return nil
 }
