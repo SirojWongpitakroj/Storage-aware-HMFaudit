@@ -1,6 +1,10 @@
 package all
 
-import "crypto/sha256"
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+)
 
 // Page struct
 type Page struct {
@@ -48,12 +52,20 @@ func (page *Page) findKeyIdx(currKey LocatorKey) int {
 }
 
 func (page *Page) leafHash() [32]byte {
-	concatLeaf := []byte("LEAF")
-	for index, key := range page.Keys {
-		concatLeaf = append(concatLeaf, encodeKey(key)...)
-		concatLeaf = append(concatLeaf, encodeValue(page.Values[index])...)
+	var encoded bytes.Buffer
+	encoded.WriteString("LEAF")
+	binary.Write(&encoded, binary.BigEndian, page.PageID)
+	if page.Next == nil {
+		encoded.WriteByte(0)
+	} else {
+		encoded.WriteByte(1)
+		binary.Write(&encoded, binary.BigEndian, page.Next.PageID)
 	}
-	return sha256.Sum256(concatLeaf)
+	for index, key := range page.Keys {
+		encoded.Write(encodeKey(key))
+		encoded.Write(encodeValue(page.Values[index]))
+	}
+	return sha256.Sum256(encoded.Bytes())
 }
 
 func (page *Page) internalHash() [32]byte {

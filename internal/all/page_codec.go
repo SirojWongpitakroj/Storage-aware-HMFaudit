@@ -2,6 +2,7 @@ package all
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"uuid"
 )
 
-const PageFormatVersion int32 = 1 //maybe future production version
+// Version 2 binds PageID and NextPageID into leaf hashes. Existing version 1
+// ALL pages must be rebuilt before they can be queried with this code.
+const PageFormatVersion int32 = 2
 
 // MarshalPage returns the deterministic on-disk representation of one page.
 func MarshalPage(page Page) ([]byte, error) {
@@ -130,6 +133,44 @@ func UnmarshalPage(data []byte) (Page, error) {
 		return Page{}, fmt.Errorf("unmarshal page: unexpected trailing data")
 	}
 	return page, nil
+}
+
+// UnmarshalStoredPage restores the page fields stored outside page_data and
+// verifies that the decoded contents produce the persisted page hash.
+func UnmarshalStoredPage(data []byte, pageID int64, parentPageID, nextPageID *int64,
+	pageHash []byte) (Page, error) {
+
+	if len(pageHash) != 32 {
+		return Page{}, fmt.Errorf("unmarshal stored page %d: page hash has %d bytes, want 32", pageID, len(pageHash))
+	}
+
+	page, err := UnmarshalPage(data)
+	if err != nil {
+		return Page{}, fmt.Errorf("unmarshal stored page %d: %w", pageID, err)
+	}
+	page.PageID = pageID
+	page.ParentPageID = copyInt64Pointer(parentPageID)
+	if nextPageID != nil {
+		page.Next = &Page{PageID: *nextPageID}
+	}
+	copy(page.Hash[:], pageHash)
+
+	computed := page.internalHash()
+	if page.IsLeaf {
+		computed = page.leafHash()
+	}
+	if subtle.ConstantTimeCompare(computed[:], page.Hash[:]) != 1 {
+		return Page{}, fmt.Errorf("unmarshal stored page %d: page hash does not match page data", pageID)
+	}
+	return page, nil
+}
+
+func copyInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func unmarshalKey(data []byte) (LocatorKey, error) {

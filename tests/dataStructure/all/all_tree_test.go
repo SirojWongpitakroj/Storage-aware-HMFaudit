@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -187,6 +188,239 @@ func TestLocatorTreeHashAuthenticatesLocatorValue(t *testing.T) {
 	}
 }
 
+func TestLocatorTreeResolveRangeAcrossLeafPages(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 10; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+
+	result, err := tree.ResolveRange(testLocatorKey(4), testLocatorKey(6))
+	if err != nil {
+		t.Fatalf("resolve range: %v", err)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("entry count = %d, want 2", len(result.Entries))
+	}
+	for index, wantLeafID := range []string{"4", "5"} {
+		if result.Entries[index].Value == nil || result.Entries[index].Value.LeafID != wantLeafID {
+			t.Fatalf("entry %d leaf ID = %+v, want %s", index, result.Entries[index].Value, wantLeafID)
+		}
+	}
+	if result.Predecessor == nil || result.Predecessor.Value.LeafID != "3" {
+		t.Fatalf("predecessor = %+v, want leaf ID 3", result.Predecessor)
+	}
+	if result.Successor == nil || result.Successor.Value.LeafID != "6" {
+		t.Fatalf("successor = %+v, want leaf ID 6", result.Successor)
+	}
+}
+
+func TestLocatorTreeResolveRangeAtTreeEdges(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 5; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+
+	lower := testLocatorKey(0)
+	upper := testLocatorKey(5)
+	result, err := tree.ResolveRange(lower, upper)
+	if err != nil {
+		t.Fatalf("resolve full range: %v", err)
+	}
+	if len(result.Entries) != 5 {
+		t.Fatalf("entry count = %d, want 5", len(result.Entries))
+	}
+	if result.Predecessor != nil {
+		t.Fatalf("predecessor = %+v, want nil at left tree edge", result.Predecessor)
+	}
+	if result.Successor != nil {
+		t.Fatalf("successor = %+v, want nil at right tree edge", result.Successor)
+	}
+}
+
+func TestLocatorQueryResolveUsesHalfOpenTimeRange(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 4; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+
+	start := testLocatorKey(1).EventTime
+	end := testLocatorKey(3).EventTime
+	result, err := tree.Resolve(locator.LocatorQuery{
+		TenantID:  "tenant",
+		ServiceID: "service",
+		LogType:   "audit",
+		RegionID:  "region",
+		StartTime: start,
+		EndTime:   end,
+	})
+	if err != nil {
+		t.Fatalf("resolve query: %v", err)
+	}
+	if len(result.Entries) != 2 || result.Entries[0].Value.LeafID != "1" || result.Entries[1].Value.LeafID != "2" {
+		t.Fatalf("unexpected half-open range entries: %+v", result.Entries)
+	}
+	if result.Predecessor == nil || result.Predecessor.Value.LeafID != "0" {
+		t.Fatalf("predecessor = %+v, want leaf ID 0", result.Predecessor)
+	}
+	if result.Successor == nil || result.Successor.Value.LeafID != "3" {
+		t.Fatalf("successor = %+v, want leaf ID 3", result.Successor)
+	}
+}
+
+func TestResolveRangeWithReaderFetchesDetachedPages(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 10; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+	reader := newDetachedPageReader(t, tree.RootPage)
+
+	result, err := locator.ResolveRangeWithReader(
+		context.Background(),
+		reader,
+		tree.RootPageID,
+		tree.RootHash,
+		testLocatorKey(4),
+		testLocatorKey(6),
+	)
+	if err != nil {
+		t.Fatalf("resolve detached range: %v", err)
+	}
+	if len(result.Entries) != 2 || result.Entries[0].Value.LeafID != "4" || result.Entries[1].Value.LeafID != "5" {
+		t.Fatalf("unexpected detached range entries: %+v", result.Entries)
+	}
+	if result.Predecessor == nil || result.Predecessor.Value.LeafID != "3" {
+		t.Fatalf("predecessor = %+v, want leaf ID 3", result.Predecessor)
+	}
+	if result.Successor == nil || result.Successor.Value.LeafID != "6" {
+		t.Fatalf("successor = %+v, want leaf ID 6", result.Successor)
+	}
+	if result.Proof.ReconstructedRoot != tree.RootHash {
+		t.Fatalf("reconstructed root = %x, want %x", result.Proof.ReconstructedRoot, tree.RootHash)
+	}
+	if err := locator.VerifyLocatorPathProofs(result.Proof, tree.RootHash); err != nil {
+		t.Fatalf("verify locator path proofs: %v", err)
+	}
+	if err := locator.VerifyLocatorRangeResult(
+		testLocatorKey(4), testLocatorKey(6), result, tree.RootHash,
+	); err != nil {
+		t.Fatalf("verify locator range result: %v", err)
+	}
+	if len(result.Proof.Leaves) < 2 {
+		t.Fatalf("proof leaf count = %d, want proofs for multiple range pages", len(result.Proof.Leaves))
+	}
+	if len(reader.reads) <= tree.Height {
+		t.Fatalf("read %d unique pages, expected root paths and boundary pages", len(reader.reads))
+	}
+}
+
+func TestVerifyLocatorRangeResultRejectsIncompleteResults(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 12; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+	lower := testLocatorKey(2)
+	upper := testLocatorKey(10)
+	result, err := tree.ResolveRange(lower, upper)
+	if err != nil {
+		t.Fatalf("resolve range: %v", err)
+	}
+	if err := locator.VerifyLocatorRangeResult(lower, upper, result, tree.RootHash); err != nil {
+		t.Fatalf("verify valid range: %v", err)
+	}
+
+	t.Run("missing returned entry", func(t *testing.T) {
+		changed := result
+		changed.Entries = append([]locator.LocatorEntry(nil), result.Entries[1:]...)
+		if err := locator.VerifyLocatorRangeResult(lower, upper, changed, tree.RootHash); err == nil {
+			t.Fatal("verification accepted an omitted matching entry")
+		}
+	})
+
+	t.Run("changed returned address", func(t *testing.T) {
+		changed := result
+		changed.Entries = append([]locator.LocatorEntry(nil), result.Entries...)
+		value := *changed.Entries[0].Value
+		value.LeafID = "forged"
+		changed.Entries[0].Value = &value
+		if err := locator.VerifyLocatorRangeResult(lower, upper, changed, tree.RootHash); err == nil {
+			t.Fatal("verification accepted a changed physical address")
+		}
+	})
+
+	t.Run("missing predecessor", func(t *testing.T) {
+		changed := result
+		changed.Predecessor = nil
+		if err := locator.VerifyLocatorRangeResult(lower, upper, changed, tree.RootHash); err == nil {
+			t.Fatal("verification accepted a missing predecessor")
+		}
+	})
+
+	t.Run("missing successor", func(t *testing.T) {
+		changed := result
+		changed.Successor = nil
+		if err := locator.VerifyLocatorRangeResult(lower, upper, changed, tree.RootHash); err == nil {
+			t.Fatal("verification accepted a missing successor")
+		}
+	})
+
+	t.Run("missing intermediate leaf", func(t *testing.T) {
+		if len(result.Proof.Leaves) < 3 {
+			t.Fatalf("proof has %d leaves, need at least 3", len(result.Proof.Leaves))
+		}
+		changed := result
+		changed.Proof = result.Proof
+		changed.Proof.Leaves = append([]locator.LocatorLeafProof(nil), result.Proof.Leaves...)
+		changed.Proof.Leaves = append(changed.Proof.Leaves[:1], changed.Proof.Leaves[2:]...)
+		if err := locator.VerifyLocatorRangeResult(lower, upper, changed, tree.RootHash); err == nil {
+			t.Fatal("verification accepted a missing intermediate leaf")
+		}
+	})
+}
+
+func TestVerifyLocatorPathProofsRejectsChangedSiblingHash(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	for index := 0; index < 10; index++ {
+		tree.Insert(testLocatorKey(index), testLocatorValue(index), tree.RootPage)
+	}
+	result, err := tree.ResolveRange(testLocatorKey(4), testLocatorKey(6))
+	if err != nil {
+		t.Fatalf("resolve range: %v", err)
+	}
+
+	proof := result.Proof
+	proof.Leaves = append([]locator.LocatorLeafProof(nil), proof.Leaves...)
+	proof.Leaves[0].Path = append([]locator.LocatorProofStep(nil), proof.Leaves[0].Path...)
+	step := &proof.Leaves[0].Path[0]
+	step.ChildHashes = append([][32]byte(nil), step.ChildHashes...)
+	siblingIndex := 0
+	if siblingIndex == step.ChildIndex {
+		siblingIndex = 1
+	}
+	step.ChildHashes[siblingIndex][0] ^= 0xff
+
+	if err := locator.VerifyLocatorPathProofs(proof, tree.RootHash); err == nil {
+		t.Fatal("path verification accepted a changed sibling hash")
+	}
+}
+
+func TestResolveRangeWithReaderRejectsUntrustedRoot(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	tree.Insert(testLocatorKey(0), testLocatorValue(0), tree.RootPage)
+	reader := newDetachedPageReader(t, tree.RootPage)
+
+	_, err := locator.ResolveRangeWithReader(
+		context.Background(),
+		reader,
+		tree.RootPageID,
+		[32]byte{1},
+		testLocatorKey(0),
+		testLocatorKey(1),
+	)
+	if err == nil {
+		t.Fatal("resolve range accepted a root page that does not match the trusted root")
+	}
+}
+
 func TestPageCodecRoundTrip(t *testing.T) {
 	t.Run("leaf", func(t *testing.T) {
 		page := locator.Page{
@@ -239,6 +473,27 @@ func TestPageCodecRoundTrip(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestStoredLeafHashAuthenticatesPageAndNextPageIDs(t *testing.T) {
+	tree := locator.NewLocatorTree(4)
+	tree.Insert(testLocatorKey(0), testLocatorValue(0), tree.RootPage)
+	data, err := locator.MarshalPage(*tree.RootPage)
+	if err != nil {
+		t.Fatalf("marshal root leaf: %v", err)
+	}
+
+	wrongNextPageID := int64(99)
+	if _, err := locator.UnmarshalStoredPage(
+		data, tree.RootPageID, nil, &wrongNextPageID, tree.RootHash[:],
+	); err == nil {
+		t.Fatal("stored leaf accepted a changed next page ID")
+	}
+	if _, err := locator.UnmarshalStoredPage(
+		data, tree.RootPageID+1, nil, nil, tree.RootHash[:],
+	); err == nil {
+		t.Fatal("stored leaf accepted a changed page ID")
+	}
 }
 
 func assertLocatorTree(t *testing.T, tree *locator.LocatorTree, recordCount int) {
@@ -367,4 +622,57 @@ func testLocatorValue(index int) *locator.LocatorValue {
 		SegmentID: "2",
 		LeafID:    fmt.Sprint(index),
 	}
+}
+
+type detachedPageReader struct {
+	pages map[int64]*locator.Page
+	reads map[int64]int
+}
+
+func newDetachedPageReader(t *testing.T, root *locator.Page) *detachedPageReader {
+	t.Helper()
+	reader := &detachedPageReader{
+		pages: make(map[int64]*locator.Page),
+		reads: make(map[int64]int),
+	}
+	var detach func(*locator.Page)
+	detach = func(page *locator.Page) {
+		if _, exists := reader.pages[page.PageID]; exists {
+			return
+		}
+		data, err := locator.MarshalPage(*page)
+		if err != nil {
+			t.Fatalf("marshal detached page %d: %v", page.PageID, err)
+		}
+		var nextPageID *int64
+		if page.Next != nil {
+			next := page.Next.PageID
+			nextPageID = &next
+		}
+		detached, err := locator.UnmarshalStoredPage(
+			data,
+			page.PageID,
+			page.ParentPageID,
+			nextPageID,
+			page.Hash[:],
+		)
+		if err != nil {
+			t.Fatalf("unmarshal detached page %d: %v", page.PageID, err)
+		}
+		reader.pages[page.PageID] = &detached
+		for _, child := range page.Children {
+			detach(child)
+		}
+	}
+	detach(root)
+	return reader
+}
+
+func (reader *detachedPageReader) ReadPage(_ context.Context, pageID int64) (*locator.Page, error) {
+	page, exists := reader.pages[pageID]
+	if !exists {
+		return nil, fmt.Errorf("detached page %d not found", pageID)
+	}
+	reader.reads[pageID]++
+	return page, nil
 }

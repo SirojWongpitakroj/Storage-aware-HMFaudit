@@ -49,8 +49,9 @@ USE hmf_audit;
 --   INTERNAL: separator keys, ordered child page IDs and child hashes.
 -- Serialize references as IDs, not Go pointers. Preserve the full logical
 -- timestamp precision in the blob (CQL timestamp metadata is milliseconds).
--- Leaf hashes must bind both keys and physical addresses. Hashing only
--- keys would leave the logical-to-physical mapping unauthenticated.
+-- Leaf hashes bind PageID, NextPageID, keys, and physical addresses. This
+-- authenticates both each mapping and the linked-leaf order used by range
+-- proofs. Hashing only keys would leave both properties unauthenticated.
 -- page_hash is the authenticated hash h(P) or h(U).
 -- parent_page_id is NULL for the root; next_page_id is NULL for internal
 -- pages and the last leaf. Redundant columns must agree with page_data.

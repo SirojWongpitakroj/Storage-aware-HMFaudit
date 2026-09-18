@@ -6,24 +6,45 @@ import (
 	"encoding/binary"
 )
 
-// Less fn compares lexicographically (Tenant, Service, LogType, Region, Timestamp)
-func (key *LocatorKey) Less(other LocatorKey) bool {
+// Compare compares locator keys lexicographically by TenantID, ServiceID,
+// LogType, RegionID, EventTime, and LogID.
+func (key LocatorKey) Compare(other LocatorKey) int {
 	if key.TenantID != other.TenantID {
-		return key.TenantID < other.TenantID
+		if key.TenantID < other.TenantID {
+			return -1
+		}
+		return 1
 	}
 	if key.ServiceID != other.ServiceID {
-		return key.ServiceID < other.ServiceID
+		if key.ServiceID < other.ServiceID {
+			return -1
+		}
+		return 1
 	}
 	if key.LogType != other.LogType {
-		return key.LogType < other.LogType
+		if key.LogType < other.LogType {
+			return -1
+		}
+		return 1
 	}
 	if key.RegionID != other.RegionID {
-		return key.RegionID < other.RegionID
+		if key.RegionID < other.RegionID {
+			return -1
+		}
+		return 1
 	}
 	if !key.EventTime.Equal(other.EventTime) {
-		return key.EventTime.Before(other.EventTime)
+		if key.EventTime.Before(other.EventTime) {
+			return -1
+		}
+		return 1
 	}
-	return key.LogID.Compare(other.LogID) < 0
+	return key.LogID.Compare(other.LogID)
+}
+
+// Less reports whether key sorts before other.
+func (key *LocatorKey) Less(other LocatorKey) bool {
+	return key.Compare(other) < 0
 }
 
 func writeString(buf *bytes.Buffer, s string) {
