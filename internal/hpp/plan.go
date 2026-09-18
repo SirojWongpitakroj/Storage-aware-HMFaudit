@@ -3,10 +3,10 @@ package hpp
 import "context"
 
 type PhysicalAddress struct {
-	RegionID  string
-	ShardID   int64
-	SegmentID int64
-	LeafID    int64
+	RegionID  string `json:"region_id"`
+	ShardID   int64  `json:"shard_id"`
+	SegmentID int64  `json:"segment_id"`
+	LeafID    int64  `json:"leaf_id"`
 }
 
 type RequestedLeaf struct {
@@ -24,10 +24,10 @@ const (
 )
 
 type TreeRef struct {
-	Layer     TreeLayer
-	RegionID  string
-	ShardID   int64
-	SegmentID int64
+	Layer     TreeLayer `json:"layer"`
+	RegionID  string    `json:"region_id"`
+	ShardID   int64     `json:"shard_id"`
+	SegmentID int64     `json:"segment_id"`
 }
 
 type SegmentKey struct {
@@ -42,13 +42,13 @@ type ShardKey struct {
 }
 
 type NodePosition struct {
-	Level int32
-	Index int64
+	Level int32 `json:"level"`
+	Index int64 `json:"index"`
 }
 
 type NodeRef struct {
-	Tree     TreeRef
-	Position NodePosition
+	Tree     TreeRef      `json:"tree"`
+	Position NodePosition `json:"position"`
 }
 
 type SegmentMetadata struct {
@@ -70,42 +70,42 @@ type HierarchyMetadata struct {
 }
 
 type TreePlan struct {
-	Tree      TreeRef
-	LeafCount int64
-	Targets   []int64
-	Required  []NodePosition
+	Tree      TreeRef        `json:"tree"`
+	LeafCount int64          `json:"leaf_count"`
+	Targets   []int64        `json:"targets"`
+	Required  []NodePosition `json:"required"`
 }
 
 type ParentLink struct {
-	Child           TreeRef
-	Parent          TreeRef
-	ParentLeafIndex int64
+	Child           TreeRef `json:"child"`
+	Parent          TreeRef `json:"parent"`
+	ParentLeafIndex int64   `json:"parent_leaf_index"`
 }
 
 type SegmentRequest struct {
-	Tree        TreeRef
-	RegionID    string
-	ShardID     int64
-	SegmentID   int64
-	Level       int32
-	NodeIndexes []int64
+	Tree        TreeRef `json:"tree"`
+	RegionID    string  `json:"region_id"`
+	ShardID     int64   `json:"shard_id"`
+	SegmentID   int64   `json:"segment_id"`
+	Level       int32   `json:"level"`
+	NodeIndexes []int64 `json:"node_indexes"`
 }
 
 type UpperRequest struct {
-	Tree        TreeRef
-	ScopeType   string
-	ScopeID     string
-	BucketID    int64
-	Level       int32
-	NodeIndexes []int64
+	Tree        TreeRef `json:"tree"`
+	ScopeType   string  `json:"scope_type"`
+	ScopeID     string  `json:"scope_id"`
+	BucketID    int64   `json:"bucket_id"`
+	Level       int32   `json:"level"`
+	NodeIndexes []int64 `json:"node_indexes"`
 }
 
 type ProofPlan struct {
-	Addresses       []PhysicalAddress
-	Trees           []TreePlan
-	ParentLinks     []ParentLink
-	SegmentRequests []SegmentRequest
-	UpperRequests   []UpperRequest
+	Addresses       []PhysicalAddress `json:"addresses"`
+	Trees           []TreePlan        `json:"trees"`
+	ParentLinks     []ParentLink      `json:"parent_links"`
+	SegmentRequests []SegmentRequest  `json:"segment_requests"`
+	UpperRequests   []UpperRequest    `json:"upper_requests"`
 }
 
 type ProofNode struct {
@@ -122,6 +122,16 @@ type HMFProof struct {
 type VerificationResult struct {
 	CalculatedGlobalRoot [32]byte
 	Proof                HMFProof
+}
+
+// ProofTrace contains every supplied or reconstructed node used while
+// verifying one HMF multiproof. RawRoots are roots before topology binding;
+// CommittedRoots bind each root to its tree identity and leaf count.
+type ProofTrace struct {
+	GlobalRoot     [32]byte
+	RawRoots       map[TreeRef][32]byte
+	CommittedRoots map[TreeRef][32]byte
+	Nodes          map[NodeRef][32]byte
 }
 
 type MetadataReader interface {

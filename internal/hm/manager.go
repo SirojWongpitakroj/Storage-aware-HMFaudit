@@ -142,7 +142,13 @@ func (hm *Manager) closeSegment(regionID string, shardID int64) (hmf.HMFUpdate, 
 	}
 
 	hm.hmfMu.Lock()
-	update, err := hm.AppendSealedSegment(regionID, shardID, activeSegment.Tree.Root)
+	update, err := hm.AppendSealedSegment(
+		regionID,
+		shardID,
+		activeSegment.Tree.TreeID.SegmentID,
+		activeSegment.Tree.LeafCount,
+		activeSegment.Tree.Root,
+	)
 	hm.hmfMu.Unlock()
 	if err != nil {
 		return hmf.HMFUpdate{}, err

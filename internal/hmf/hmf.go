@@ -104,9 +104,19 @@ func NewHMF(config HMFConfig) (*HMF, error) {
 			forest.shardIndexes[treeID] = shardIndex
 		}
 	}
+	for _, regionID := range config.RegionIDs {
+		shardRoots := make([][32]byte, config.NumShardsPerRegion)
+		for shardIndex := range config.NumShardsPerRegion {
+			shardRoots[shardIndex] = CommitShardRoot(regionID, int64(shardIndex), 0, [32]byte{})
+		}
+		if _, err := forest.RegionTrees[regionID].Build(shardRoots); err != nil {
+			return nil, fmt.Errorf("new HMF: build initial region tree %s: %w", regionID, err)
+		}
+	}
 	regionRoots := make([][32]byte, len(config.RegionIDs))
 	for regionIndex, regionID := range config.RegionIDs {
-		regionRoots[regionIndex] = forest.RegionTrees[regionID].Root
+		region := forest.RegionTrees[regionID]
+		regionRoots[regionIndex] = CommitRegionRoot(regionID, region.LeafCount, region.Root)
 	}
 	if _, err := forest.GlobalTree.Build(regionRoots); err != nil {
 		return nil, fmt.Errorf("new HMF: build initial global tree: %w", err)
@@ -116,12 +126,16 @@ func NewHMF(config HMFConfig) (*HMF, error) {
 }
 
 func (forest *HMF) Root() [32]byte {
-	return forest.GlobalTree.Root
+	return CommitGlobalRoot(forest.GlobalTree.LeafCount, forest.GlobalTree.Root)
 }
 
 // AppendSealedSegment adds a sealed Segment root to its Shard and propagates
 // the resulting root through the Region and Global trees.
-func (forest *HMF) AppendSealedSegment(regionID string, shardID int64, segmentRoot [32]byte) (HMFUpdate, error) {
+func (forest *HMF) AppendSealedSegment(regionID string, shardID, segmentID,
+	segmentLeafCount int64, segmentRoot [32]byte) (HMFUpdate, error) {
+	if segmentID < 0 || segmentLeafCount <= 0 {
+		return HMFUpdate{}, fmt.Errorf("append sealed segment: invalid segment ID or leaf count")
+	}
 	shardTreeID := TreeID{
 		Type:     TreeShard,
 		RegionID: regionID,
@@ -133,7 +147,8 @@ func (forest *HMF) AppendSealedSegment(regionID string, shardID int64, segmentRo
 	}
 
 	shardLeafIndex := shardTree.LeafCount
-	shardNodes, err := shardTree.Append(segmentRoot)
+	segmentCommitment := CommitSegmentRoot(regionID, shardID, segmentID, segmentLeafCount, segmentRoot)
+	shardNodes, err := shardTree.Append(segmentCommitment)
 	if err != nil {
 		return HMFUpdate{}, err
 	}
@@ -143,13 +158,15 @@ func (forest *HMF) AppendSealedSegment(regionID string, shardID int64, segmentRo
 		return HMFUpdate{}, fmt.Errorf("append sealed segment: region %s does not exist", regionID)
 	}
 	shardIndex := forest.shardIndexes[shardTreeID]
-	regionNodes, err := regionTree.updateShardRoot(shardIndex, shardTree.Root)
+	shardCommitment := CommitShardRoot(regionID, shardID, shardTree.LeafCount, shardTree.Root)
+	regionNodes, err := regionTree.updateShardRoot(shardIndex, shardCommitment)
 	if err != nil {
 		return HMFUpdate{}, err
 	}
 
 	regionIndex := forest.regionIndexes[regionID]
-	globalNodes, err := forest.GlobalTree.UpdateRegionRoot(regionIndex, regionTree.Root)
+	regionCommitment := CommitRegionRoot(regionID, regionTree.LeafCount, regionTree.Root)
+	globalNodes, err := forest.GlobalTree.UpdateRegionRoot(regionIndex, regionCommitment)
 	if err != nil {
 		return HMFUpdate{}, err
 	}
@@ -157,20 +174,20 @@ func (forest *HMF) AppendSealedSegment(regionID string, shardID int64, segmentRo
 	return HMFUpdate{
 		ShardTreeID:           shardTreeID,
 		ShardNodes:            shardNodes,
-		ShardRoot:             shardTree.Root,
+		ShardRoot:             shardCommitment,
 		ShardLeaves:           shardTree.LeafCount,
 		ShardHeight:           shardTree.Height,
 		ShardFrontiers:        shardTree.Frontiers(),
 		ShardLeafIndex:        shardLeafIndex,
 		RegionTreeID:          regionTree.TreeID,
 		RegionNodes:           regionNodes,
-		RegionRoot:            regionTree.Root,
+		RegionRoot:            regionCommitment,
 		RegionLeaves:          regionTree.LeafCount,
 		RegionHeight:          regionTree.Height,
 		RegionParentLeafIndex: int64(shardIndex),
 		GlobalTreeID:          forest.GlobalTree.TreeID,
 		GlobalNodes:           globalNodes,
-		GlobalRoot:            forest.GlobalTree.Root,
+		GlobalRoot:            forest.Root(),
 		GlobalLeaves:          forest.GlobalTree.LeafCount,
 		GlobalHeight:          forest.GlobalTree.Height,
 		GlobalParentLeafIndex: int64(regionIndex),

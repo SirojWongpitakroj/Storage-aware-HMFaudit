@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SirojWongpitakroj/hmf-audit/internal/checkpoint"
 	cassandrastore "github.com/SirojWongpitakroj/hmf-audit/internal/storage/cassandra"
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
@@ -41,6 +42,10 @@ func TestCassandraRepositories(t *testing.T) {
 
 	t.Run("checkpoint repository", func(t *testing.T) {
 		testCheckpointRepo(t, session)
+	})
+
+	t.Run("checkpoint service store", func(t *testing.T) {
+		testCheckpointServiceStore(t, session)
 	})
 }
 
@@ -438,6 +443,59 @@ func testCheckpointRepo(t *testing.T, session *gocql.Session) {
 		!bytes.Equal(gotState.StateCommitment, state.StateCommitment) {
 		t.Fatalf("unexpected finality state: %+v", gotState)
 	}
+}
+
+func testCheckpointServiceStore(t *testing.T, session *gocql.Session) {
+	ctx := context.Background()
+	systemID := "test-checkpoint-service:" + gocql.TimeUUID().String()
+	locatorTreeID := "locator-main"
+	cleanupQuery(t, session, `
+		DELETE FROM checkpoint_roots
+		WHERE system_id = ? AND checkpoint_sequence = ?
+	`, systemID, int64(1))
+	cleanupQuery(t, session,
+		"DELETE FROM finality_state WHERE system_id = ?",
+		systemID,
+	)
+
+	store, err := cassandrastore.NewCheckpointStore(session, locatorTreeID)
+	if err != nil {
+		t.Fatalf("new checkpoint store: %v", err)
+	}
+	service, err := checkpoint.NewService(systemID, integrationStateSource{snapshot: checkpoint.RootSnapshot{
+		LocatorTreeID: locatorTreeID,
+		LocatorRoot:   bytesToHash(testHash("service-locator-root")),
+		GlobalHMFRoot: bytesToHash(testHash("service-global-root")),
+	}}, checkpoint.NewMockAnchor(500), store)
+	if err != nil {
+		t.Fatalf("new checkpoint service: %v", err)
+	}
+	finalized, err := service.Finalize(ctx)
+	if err != nil {
+		t.Fatalf("finalize Cassandra-backed checkpoint: %v", err)
+	}
+	current, err := service.Current(ctx)
+	if err != nil {
+		t.Fatalf("read current Cassandra-backed checkpoint: %v", err)
+	}
+	if current.ID != finalized.ID || current.Sequence != 1 ||
+		current.StateCommitment != finalized.StateCommitment {
+		t.Fatalf("current checkpoint = %+v, want %+v", current, finalized)
+	}
+}
+
+type integrationStateSource struct {
+	snapshot checkpoint.RootSnapshot
+}
+
+func (source integrationStateSource) Snapshot(context.Context) (checkpoint.RootSnapshot, error) {
+	return source.snapshot, nil
+}
+
+func bytesToHash(value []byte) [32]byte {
+	var result [32]byte
+	copy(result[:], value)
+	return result
 }
 
 func newCassandraSession(t *testing.T) *gocql.Session {

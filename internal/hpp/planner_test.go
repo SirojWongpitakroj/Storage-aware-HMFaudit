@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 )
 
 func TestPlanTreeDeduplicatesSharedPathsAndPromotesOddNodes(t *testing.T) {
@@ -61,9 +62,13 @@ func TestPlannerAndVerifierReconstructGlobalRoot(t *testing.T) {
 
 	segmentLeaves := [][32]byte{testDigest("log-0"), testDigest("log-1"), testDigest("log-2"), testDigest("log-3")}
 	segmentRoot, segmentNodes := testTree(segmentLeaves)
-	shardRoot, shardNodes := testTree([][32]byte{segmentRoot, testDigest("other-segment")})
-	regionRoot, regionNodes := testTree([][32]byte{shardRoot, testDigest("other-shard")})
-	globalRoot, globalNodes := testTree([][32]byte{regionRoot, testDigest("other-region")})
+	segmentCommitment := hmf.CommitSegmentRoot("R0", 0, 10, 4, segmentRoot)
+	shardRawRoot, shardNodes := testTree([][32]byte{segmentCommitment, testDigest("other-segment")})
+	shardCommitment := hmf.CommitShardRoot("R0", 0, 2, shardRawRoot)
+	regionRawRoot, regionNodes := testTree([][32]byte{shardCommitment, testDigest("other-shard")})
+	regionCommitment := hmf.CommitRegionRoot("R0", 2, regionRawRoot)
+	globalRawRoot, globalNodes := testTree([][32]byte{regionCommitment, testDigest("other-region")})
+	globalRoot := hmf.CommitGlobalRoot(2, globalRawRoot)
 
 	allNodes := map[TreeRef]map[NodePosition][32]byte{
 		segmentTree(segmentKey): segmentNodes,

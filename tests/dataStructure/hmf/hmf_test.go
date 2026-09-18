@@ -32,25 +32,46 @@ func TestHMFInitializesCanonicalUpperTreesAndReturnsProofSiblings(t *testing.T) 
 		t.Fatalf("new HMF: %v", err)
 	}
 
-	emptyShardRoots := make([][32]byte, 4)
-	emptyRegionRoot := merkleRoot(emptyShardRoots)
-	if forest.RegionTrees["R0"].Root != emptyRegionRoot || forest.RegionTrees["R1"].Root != emptyRegionRoot {
+	emptyRegionRawRoots := make(map[string][32]byte)
+	for _, regionID := range []string{"R0", "R1"} {
+		emptyShardRoots := make([][32]byte, 4)
+		for shardIndex := range emptyShardRoots {
+			emptyShardRoots[shardIndex] = hmf.CommitShardRoot(regionID, int64(shardIndex), 0, [32]byte{})
+		}
+		emptyRegionRawRoots[regionID] = merkleRoot(emptyShardRoots)
+	}
+	if forest.RegionTrees["R0"].Root != emptyRegionRawRoots["R0"] ||
+		forest.RegionTrees["R1"].Root != emptyRegionRawRoots["R1"] {
 		t.Fatal("region trees were not initialized with canonical empty-subtree hashes")
 	}
-	wantInitialGlobal := merkleRoot([][32]byte{emptyRegionRoot, emptyRegionRoot})
+	wantInitialGlobalRaw := merkleRoot([][32]byte{
+		hmf.CommitRegionRoot("R0", 4, emptyRegionRawRoots["R0"]),
+		hmf.CommitRegionRoot("R1", 4, emptyRegionRawRoots["R1"]),
+	})
+	wantInitialGlobal := hmf.CommitGlobalRoot(2, wantInitialGlobalRaw)
 	if forest.Root() != wantInitialGlobal {
 		t.Fatalf("initial global root = %x, want %x", forest.Root(), wantInitialGlobal)
 	}
 
 	segmentRoot := testHash("sealed-segment")
-	update, err := forest.AppendSealedSegment("R0", 2, segmentRoot)
+	update, err := forest.AppendSealedSegment("R0", 2, 0, 1, segmentRoot)
 	if err != nil {
 		t.Fatalf("append sealed segment: %v", err)
 	}
+	segmentCommitment := hmf.CommitSegmentRoot("R0", 2, 0, 1, segmentRoot)
+	wantShardRoot := hmf.CommitShardRoot("R0", 2, 1, segmentCommitment)
 	regionLeaves := make([][32]byte, 4)
-	regionLeaves[2] = segmentRoot
-	wantRegionRoot := merkleRoot(regionLeaves)
-	wantGlobalRoot := merkleRoot([][32]byte{wantRegionRoot, emptyRegionRoot})
+	for shardIndex := range regionLeaves {
+		regionLeaves[shardIndex] = hmf.CommitShardRoot("R0", int64(shardIndex), 0, [32]byte{})
+	}
+	regionLeaves[2] = wantShardRoot
+	wantRegionRaw := merkleRoot(regionLeaves)
+	wantRegionRoot := hmf.CommitRegionRoot("R0", 4, wantRegionRaw)
+	wantGlobalRaw := merkleRoot([][32]byte{
+		wantRegionRoot,
+		hmf.CommitRegionRoot("R1", 4, emptyRegionRawRoots["R1"]),
+	})
+	wantGlobalRoot := hmf.CommitGlobalRoot(2, wantGlobalRaw)
 	if update.RegionRoot != wantRegionRoot || update.GlobalRoot != wantGlobalRoot {
 		t.Fatalf("updated roots = %x/%x, want %x/%x",
 			update.RegionRoot, update.GlobalRoot, wantRegionRoot, wantGlobalRoot)

@@ -21,6 +21,12 @@ func NewSession(ctx context.Context, cfg Config) (*gocql.Session, error) {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	cluster.Port = cfg.Port
 	cluster.Keyspace = cfg.Keyspace
+	if cfg.Username != "" || cfg.Password != "" {
+		cluster.Authenticator = gocql.PasswordAuthenticator{
+			Username: cfg.Username,
+			Password: cfg.Password,
+		}
+	}
 
 	session, err := cluster.CreateSession()
 	if err != nil {

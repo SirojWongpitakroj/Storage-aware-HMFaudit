@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 )
 
 func VerifyHMFProof(proof HMFProof, addresses []PhysicalAddress) ([32]byte, error) {
@@ -96,11 +97,11 @@ func VerifyHMFProof(proof HMFProof, addresses []PhysicalAddress) ([32]byte, erro
 				}
 			} else {
 				for index, child := range children[treeRef] {
-					root, exists := roots[child]
+					rawRoot, exists := roots[child]
 					if !exists {
 						return [32]byte{}, fmt.Errorf("verify HMF proof: root unavailable for child %+v", child)
 					}
-					known[index] = root
+					known[index] = committedRoot(child, plans[child].LeafCount, rawRoot)
 				}
 			}
 			if err := validateTargets(treePlan, known); err != nil {
@@ -122,7 +123,89 @@ func VerifyHMFProof(proof HMFProof, addresses []PhysicalAddress) ([32]byte, erro
 	if !exists {
 		return [32]byte{}, fmt.Errorf("verify HMF proof: global tree root was not reconstructed")
 	}
-	return root, nil
+	return committedRoot(globalTree(), plans[globalTree()].LeafCount, root), nil
+}
+
+// TraceHMFProof verifies the proof and returns the complete deduplicated DAG
+// of supplied and reconstructed nodes used by that verification.
+func TraceHMFProof(proof HMFProof, addresses []PhysicalAddress) (ProofTrace, error) {
+	globalRoot, err := VerifyHMFProof(proof, addresses)
+	if err != nil {
+		return ProofTrace{}, err
+	}
+	plans := make(map[TreeRef]TreePlan, len(proof.Plan.Trees))
+	for _, plan := range proof.Plan.Trees {
+		plans[plan.Tree] = plan
+	}
+	children := make(map[TreeRef]map[int64]TreeRef)
+	for _, link := range proof.Plan.ParentLinks {
+		if children[link.Parent] == nil {
+			children[link.Parent] = make(map[int64]TreeRef)
+		}
+		children[link.Parent][link.ParentLeafIndex] = link.Child
+	}
+	proofNodes := make(map[NodeRef][32]byte, len(proof.Nodes))
+	for _, node := range proof.Nodes {
+		proofNodes[node.Ref] = node.Hash
+	}
+	leafHashes := make(map[PhysicalAddress][32]byte, len(proof.Leaves))
+	for _, leaf := range proof.Leaves {
+		leafHashes[leaf.Address] = leaf.Hash
+	}
+
+	trace := ProofTrace{
+		GlobalRoot: globalRoot, RawRoots: make(map[TreeRef][32]byte, len(plans)),
+		CommittedRoots: make(map[TreeRef][32]byte, len(plans)), Nodes: make(map[NodeRef][32]byte),
+	}
+	for layer := LayerSegment; layer <= LayerGlobal; layer++ {
+		for treeRef, treePlan := range plans {
+			if treeRef.Layer != layer {
+				continue
+			}
+			known := make(map[int64][32]byte)
+			if layer == LayerSegment {
+				for address, hash := range leafHashes {
+					if address.RegionID == treeRef.RegionID && address.ShardID == treeRef.ShardID &&
+						address.SegmentID == treeRef.SegmentID {
+						known[address.LeafID] = hash
+					}
+				}
+			} else {
+				for index, child := range children[treeRef] {
+					known[index] = trace.CommittedRoots[child]
+				}
+			}
+			treeProofNodes := make(map[NodePosition][32]byte, len(treePlan.Required))
+			for _, position := range treePlan.Required {
+				treeProofNodes[position] = proofNodes[NodeRef{Tree: treeRef, Position: position}]
+			}
+			rawRoot, expanded, err := reconstructTreeTrace(treePlan.LeafCount, known, treeProofNodes)
+			if err != nil {
+				return ProofTrace{}, fmt.Errorf("trace HMF proof tree %+v: %w", treeRef, err)
+			}
+			trace.RawRoots[treeRef] = rawRoot
+			trace.CommittedRoots[treeRef] = committedRoot(treeRef, treePlan.LeafCount, rawRoot)
+			for position, hash := range expanded {
+				trace.Nodes[NodeRef{Tree: treeRef, Position: position}] = hash
+			}
+		}
+	}
+	return trace, nil
+}
+
+func committedRoot(tree TreeRef, leafCount int64, rawRoot [32]byte) [32]byte {
+	switch tree.Layer {
+	case LayerSegment:
+		return hmf.CommitSegmentRoot(tree.RegionID, tree.ShardID, tree.SegmentID, leafCount, rawRoot)
+	case LayerShard:
+		return hmf.CommitShardRoot(tree.RegionID, tree.ShardID, leafCount, rawRoot)
+	case LayerRegion:
+		return hmf.CommitRegionRoot(tree.RegionID, leafCount, rawRoot)
+	case LayerGlobal:
+		return hmf.CommitGlobalRoot(leafCount, rawRoot)
+	default:
+		return [32]byte{}
+	}
 }
 
 func validateTreePlanShape(plan TreePlan) error {
@@ -231,16 +314,27 @@ func validateTargets(plan TreePlan, known map[int64][32]byte) error {
 
 func reconstructTreeRoot(leafCount int64, knownLeaves map[int64][32]byte,
 	proofNodes map[NodePosition][32]byte) ([32]byte, error) {
+	root, _, err := reconstructTreeTrace(leafCount, knownLeaves, proofNodes)
+	return root, err
+}
+
+func reconstructTreeTrace(leafCount int64, knownLeaves map[int64][32]byte,
+	proofNodes map[NodePosition][32]byte) ([32]byte, map[NodePosition][32]byte, error) {
 
 	if leafCount <= 0 || len(knownLeaves) == 0 {
-		return [32]byte{}, fmt.Errorf("invalid tree leaf count or empty target set")
+		return [32]byte{}, nil, fmt.Errorf("invalid tree leaf count or empty target set")
 	}
+	expanded := make(map[NodePosition][32]byte, len(knownLeaves)+len(proofNodes))
 	current := make(map[int64][32]byte, len(knownLeaves))
 	for index, hash := range knownLeaves {
 		if index < 0 || index >= leafCount {
-			return [32]byte{}, fmt.Errorf("known leaf index %d out of range", index)
+			return [32]byte{}, nil, fmt.Errorf("known leaf index %d out of range", index)
 		}
 		current[index] = hash
+		expanded[NodePosition{Level: 0, Index: index}] = hash
+	}
+	for position, hash := range proofNodes {
+		expanded[position] = hash
 	}
 	used := make(map[NodePosition]bool, len(proofNodes))
 	width := leafCount
@@ -256,31 +350,32 @@ func reconstructTreeRoot(leafCount int64, knownLeaves map[int64][32]byte,
 			rightIndex := leftIndex + 1
 			left, err := nodeHashAt(current, proofNodes, used, NodePosition{Level: level, Index: leftIndex})
 			if err != nil {
-				return [32]byte{}, err
+				return [32]byte{}, nil, err
 			}
 			parent := left
 			if rightIndex < width {
 				right, err := nodeHashAt(current, proofNodes, used, NodePosition{Level: level, Index: rightIndex})
 				if err != nil {
-					return [32]byte{}, err
+					return [32]byte{}, nil, err
 				}
 				parent = domain.HashPair("NODE", &left, &right)
 			}
 			next[parentIndex] = parent
+			expanded[NodePosition{Level: level + 1, Index: parentIndex}] = parent
 		}
 		current = next
 		width = (width + 1) / 2
 		level++
 	}
 	if len(current) != 1 {
-		return [32]byte{}, fmt.Errorf("tree reconstruction produced %d roots", len(current))
+		return [32]byte{}, nil, fmt.Errorf("tree reconstruction produced %d roots", len(current))
 	}
 	for position := range proofNodes {
 		if !used[position] {
-			return [32]byte{}, fmt.Errorf("unused proof node %+v", position)
+			return [32]byte{}, nil, fmt.Errorf("unused proof node %+v", position)
 		}
 	}
-	return current[0], nil
+	return current[0], expanded, nil
 }
 
 func nodeHashAt(current map[int64][32]byte, proof map[NodePosition][32]byte,

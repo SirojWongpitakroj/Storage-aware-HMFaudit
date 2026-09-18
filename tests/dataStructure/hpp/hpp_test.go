@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/hmf"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
 )
 
@@ -32,9 +33,14 @@ func TestHPPBuildsSelfContainedBatchProofFromAddresses(t *testing.T) {
 	segmentBLeaves := hashes("segment-b", 2)
 	segmentARoot, segmentANodes := completeTree(segmentALeaves)
 	segmentBRoot, segmentBNodes := completeTree(segmentBLeaves)
-	shardRoot, shardNodes := completeTree([][32]byte{segmentARoot, segmentBRoot, digest("unused-segment")})
-	regionRoot, regionNodes := completeTree([][32]byte{shardRoot, digest("unused-shard")})
-	globalRoot, globalNodes := completeTree([][32]byte{regionRoot, digest("unused-region")})
+	segmentACommitment := hmf.CommitSegmentRoot("R0", 0, 10, 4, segmentARoot)
+	segmentBCommitment := hmf.CommitSegmentRoot("R0", 0, 11, 2, segmentBRoot)
+	shardRawRoot, shardNodes := completeTree([][32]byte{segmentACommitment, segmentBCommitment, digest("unused-segment")})
+	shardCommitment := hmf.CommitShardRoot("R0", 0, 3, shardRawRoot)
+	regionRawRoot, regionNodes := completeTree([][32]byte{shardCommitment, digest("unused-shard")})
+	regionCommitment := hmf.CommitRegionRoot("R0", 2, regionRawRoot)
+	globalRawRoot, globalNodes := completeTree([][32]byte{regionCommitment, digest("unused-region")})
+	globalRoot := hmf.CommitGlobalRoot(2, globalRawRoot)
 
 	allNodes := map[hpp.TreeRef]map[hpp.NodePosition][32]byte{
 		{Layer: hpp.LayerSegment, RegionID: "R0", ShardID: 0, SegmentID: 10}: segmentANodes,
