@@ -155,42 +155,46 @@ func planTree(tree TreeRef, leafCount int64, targets map[int64]struct{}) (TreePl
 	if len(targets) == 0 {
 		return TreePlan{}, fmt.Errorf("HPP: tree %+v has no target leaves", tree)
 	}
-	active := make(map[int64]struct{}, len(targets))
+	active := make([]int64, 0, len(targets))
 	for index := range targets {
 		if index < 0 || index >= leafCount {
 			return TreePlan{}, fmt.Errorf("HPP: target leaf %d outside tree %+v", index, tree)
 		}
-		active[index] = struct{}{}
+		active = append(active, index)
 	}
+	sort.Slice(active, func(left, right int) bool { return active[left] < active[right] })
+	result := TreePlan{Tree: tree, LeafCount: leafCount, Targets: append([]int64(nil), active...)}
 
-	required := make(map[NodePosition]struct{})
+	// Walking each level's sorted active indexes emits Required already in
+	// canonical (level, index) order.
+	next := make([]int64, 0, len(active))
 	width := leafCount
 	level := int32(0)
 	for width > 1 {
-		parents := make(map[int64]struct{})
-		for index := range active {
-			sibling := index ^ 1
-			if sibling < width {
-				if _, reconstructible := active[sibling]; !reconstructible {
-					required[NodePosition{Level: level, Index: sibling}] = struct{}{}
-				}
+		next = next[:0]
+		for position := 0; position < len(active); {
+			parent := active[position] / 2
+			left, right := parent*2, parent*2+1
+			haveLeft := active[position] == left
+			if haveLeft {
+				position++
 			}
-			parents[index/2] = struct{}{}
+			haveRight := position < len(active) && active[position] == right
+			if haveRight {
+				position++
+			}
+			if !haveLeft {
+				result.Required = append(result.Required, NodePosition{Level: level, Index: left})
+			}
+			if !haveRight && right < width {
+				result.Required = append(result.Required, NodePosition{Level: level, Index: right})
+			}
+			next = append(next, parent)
 		}
-		active = parents
+		active, next = next, active
 		width = (width + 1) / 2
 		level++
 	}
-
-	result := TreePlan{Tree: tree, LeafCount: leafCount}
-	for index := range targets {
-		result.Targets = append(result.Targets, index)
-	}
-	sort.Slice(result.Targets, func(left, right int) bool { return result.Targets[left] < result.Targets[right] })
-	for position := range required {
-		result.Required = append(result.Required, position)
-	}
-	sortPositions(result.Required)
 	return result, nil
 }
 

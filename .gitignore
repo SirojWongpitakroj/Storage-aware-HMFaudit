@@ -1,3 +1,9 @@
-README.md
 .vscode/
 .tmp-go-cache/
+.tmp-go-cache-codex/
+.env
+*.exe
+*.test
+*.prof
+__pycache__/
+.idea/

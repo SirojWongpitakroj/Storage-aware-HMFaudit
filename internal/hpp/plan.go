@@ -122,6 +122,9 @@ type HMFProof struct {
 type VerificationResult struct {
 	CalculatedGlobalRoot [32]byte
 	Proof                HMFProof
+	// Trace is set when the verification already traced Proof, so callers
+	// that need the trace do not reconstruct the proof again.
+	Trace *ProofTrace `json:"-"`
 }
 
 // ProofTrace contains every supplied or reconstructed node used while

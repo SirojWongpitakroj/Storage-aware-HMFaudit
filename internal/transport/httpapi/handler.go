@@ -304,8 +304,9 @@ func (handler *Handler) localize(writer http.ResponseWriter, request *http.Reque
 	}
 	if input.CheckpointSequence <= 0 ||
 		(input.K != 0 && input.K != localization.DefaultJumpLevels) || len(input.Addresses) == 0 {
-		writeError(writer, http.StatusBadRequest, "invalid_request",
-			"checkpoint_sequence must be positive, k must be 15 or omitted, and addresses must not be empty")
+		writeError(writer, http.StatusBadRequest, "invalid_request", fmt.Sprintf(
+			"checkpoint_sequence must be positive, k must be %d or omitted, and addresses must not be empty",
+			localization.DefaultJumpLevels))
 		return
 	}
 	if input.K == 0 {

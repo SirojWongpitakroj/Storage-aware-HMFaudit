@@ -27,8 +27,9 @@ func NewService(reference ReferenceBuilder) (*Service, error) {
 	return &Service{reference: reference}, nil
 }
 
-// Localize performs one authenticated reference-proof build. The underlying
-// HPP reader batches and concurrently fetches the deduplicated forest nodes.
+// Localize performs one authenticated reference-proof build. It reuses the
+// failed proof's authentication nodes where they are the committed ones, so
+// normally only the stored requested leaves are read again.
 func (service *Service) Localize(ctx context.Context, request Request) (Result, error) {
 	addresses, err := normalizeAddresses(request.Addresses)
 	if err != nil {
@@ -49,12 +50,14 @@ func (service *Service) Localize(ctx context.Context, request Request) (Result, 
 		return Result{}, ErrNoMismatch
 	}
 
-	reference, err := service.reference.BuildAndVerify(ctx, addresses, request.AnchoredGlobalRoot)
+	reference, err := service.authenticatedReference(ctx, request.FailedProof, addresses, request.AnchoredGlobalRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("localize tamper: authenticate reference state: %w", err)
 	}
-	referenceTrace, err := hpp.TraceHMFProof(reference.Proof, addresses)
-	if err != nil {
+	var referenceTrace hpp.ProofTrace
+	if reference.Trace != nil {
+		referenceTrace = *reference.Trace
+	} else if referenceTrace, err = hpp.TraceHMFProof(reference.Proof, addresses); err != nil {
 		return Result{}, fmt.Errorf("localize tamper: trace authenticated reference proof: %w", err)
 	}
 	if !equalHash(reference.CalculatedGlobalRoot, request.AnchoredGlobalRoot) ||
@@ -74,6 +77,22 @@ func (service *Service) Localize(ctx context.Context, request Request) (Result, 
 		BadShards: badShards, Rounds: rounds, Suspects: suspects,
 	}
 	return Result{CalculatedReferenceRoot: referenceTrace.GlobalRoot, Proof: proof}, nil
+}
+
+// authenticatedReference first rebuilds the reference around the failed
+// proof's authentication nodes, which only reads the stored requested leaves.
+// That rebuild succeeds only when those nodes are the committed ones, so any
+// other failure (an altered authentication node, a missing leaf) falls back to
+// a complete reference build from the reference store.
+func (service *Service) authenticatedReference(ctx context.Context, failed hpp.HMFProof,
+	addresses []hpp.PhysicalAddress, trustedRoot [32]byte) (hpp.VerificationResult, error) {
+
+	if builder, ok := service.reference.(ProofReferenceBuilder); ok {
+		if reference, err := builder.ReferenceFromProof(ctx, failed, addresses, trustedRoot); err == nil {
+			return reference, nil
+		}
+	}
+	return service.reference.BuildAndVerify(ctx, addresses, trustedRoot)
 }
 
 // VerifyProof lets the auditor independently authenticate the reference state
@@ -100,12 +119,12 @@ func VerifyProof(proof Proof, expectedAddresses []hpp.PhysicalAddress,
 		equalHash(proof.AuditorGlobalRoot, trustedRoot) {
 		return fmt.Errorf("%w: auditor proof is not the reported failed computation", ErrInvalidProof)
 	}
-	if _, err := hpp.VerifyHMFProofAgainstRoot(proof.ReferenceProof, addresses, trustedRoot); err != nil {
-		return fmt.Errorf("%w: reference proof: %v", ErrInvalidProof, err)
-	}
 	referenceTrace, err := hpp.TraceHMFProof(proof.ReferenceProof, addresses)
 	if err != nil {
-		return fmt.Errorf("%w: reference trace: %v", ErrInvalidProof, err)
+		return fmt.Errorf("%w: reference proof: %v", ErrInvalidProof, err)
+	}
+	if !equalHash(referenceTrace.GlobalRoot, trustedRoot) {
+		return fmt.Errorf("%w: reference proof: calculated global root does not match trusted root", ErrInvalidProof)
 	}
 	badShards, rounds, suspects := analyze(
 		addresses, proof.FailedProof, proof.ReferenceProof, auditorTrace, referenceTrace, proof.K,

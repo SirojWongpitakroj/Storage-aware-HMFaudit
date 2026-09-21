@@ -8,8 +8,10 @@ import (
 
 type Classification string
 
-// DefaultJumpLevels matches the configured Segment-level pruning interval.
-const DefaultJumpLevels int32 = 15
+// DefaultJumpLevels is the maximum tree height: node indexes are int64, so no
+// tree exceeds 63 levels. Each pruning round therefore jumps from a tree's
+// root straight to its leaves (analyze clamps the target level at zero).
+const DefaultJumpLevels int32 = 63
 
 const (
 	LeafMismatch               Classification = "LEAF_MISMATCH"
@@ -21,6 +23,16 @@ const (
 // it against the checkpoint root before localization trusts any of its nodes.
 type ReferenceBuilder interface {
 	BuildAndVerify(ctx context.Context, addresses []hpp.PhysicalAddress,
+		trustedRoot [32]byte) (hpp.VerificationResult, error)
+}
+
+// ProofReferenceBuilder is an optional ReferenceBuilder capability. It
+// rebuilds the reference around the failed proof's plan and authentication
+// nodes, fetching only the stored requested leaves, and authenticates the
+// result against the checkpoint root. Localize falls back to BuildAndVerify
+// whenever this rebuild is unavailable or fails.
+type ProofReferenceBuilder interface {
+	ReferenceFromProof(ctx context.Context, proof hpp.HMFProof, addresses []hpp.PhysicalAddress,
 		trustedRoot [32]byte) (hpp.VerificationResult, error)
 }
 

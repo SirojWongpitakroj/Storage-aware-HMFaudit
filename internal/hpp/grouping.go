@@ -70,15 +70,6 @@ func treeRefLess(left, right TreeRef) bool {
 	return left.SegmentID < right.SegmentID
 }
 
-func sortPositions(positions []NodePosition) {
-	sort.Slice(positions, func(left, right int) bool {
-		if positions[left].Level != positions[right].Level {
-			return positions[left].Level < positions[right].Level
-		}
-		return positions[left].Index < positions[right].Index
-	})
-}
-
 func shardBucketID(level int32, nodeIndex int64) int64 {
 	if level < 15 {
 		return nodeIndex >> (15 - level)

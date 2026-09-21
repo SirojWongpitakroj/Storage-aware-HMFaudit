@@ -41,33 +41,84 @@ func (service *Service) BuildProof(ctx context.Context, addresses []PhysicalAddr
 	if err != nil {
 		return HMFProof{}, fmt.Errorf("build HMF proof: fetch proof nodes: %w", err)
 	}
-	targets := make(map[NodeRef]PhysicalAddress, len(plan.Addresses))
-	for _, address := range plan.Addresses {
+	leaves, rest, err := splitTargetLeaves(plan.Addresses, nodes)
+	if err != nil {
+		return HMFProof{}, fmt.Errorf("build HMF proof: %w", err)
+	}
+	return HMFProof{Plan: plan, Leaves: leaves, Nodes: rest}, nil
+}
+
+// ReferenceFromProof rebuilds the reference proof for a failed audit without
+// refetching what the failed proof already carries. It keeps the supplied
+// plan and authentication nodes, loads only the stored hashes of the
+// requested leaves, and accepts the result only if it reproduces trustedRoot.
+// A supplied proof whose plan or authentication nodes differ from the
+// committed state therefore fails here, and the caller must fall back to
+// BuildAndVerify.
+func (service *Service) ReferenceFromProof(ctx context.Context, proof HMFProof,
+	addresses []PhysicalAddress, trustedRoot [32]byte) (VerificationResult, error) {
+
+	leafPlan := ProofPlan{Addresses: proof.Plan.Addresses}
+	var segments []TreePlan
+	for _, tree := range proof.Plan.Trees {
+		if tree.Tree.Layer == LayerSegment {
+			segments = append(segments, TreePlan{Tree: tree.Tree, LeafCount: tree.LeafCount, Targets: tree.Targets})
+		}
+	}
+	leafPlan.SegmentRequests, _ = buildRequests(segments)
+	nodes, err := service.nodes.FetchProofNodes(ctx, leafPlan)
+	if err != nil {
+		return VerificationResult{}, fmt.Errorf("rebuild reference proof: fetch stored leaves: %w", err)
+	}
+	leaves, rest, err := splitTargetLeaves(leafPlan.Addresses, nodes)
+	if err != nil {
+		return VerificationResult{}, fmt.Errorf("rebuild reference proof: %w", err)
+	}
+	if len(rest) != 0 {
+		return VerificationResult{}, fmt.Errorf("rebuild reference proof: %d unrequested nodes returned", len(rest))
+	}
+	reference := HMFProof{Plan: proof.Plan, Leaves: leaves, Nodes: proof.Nodes}
+	trace, err := TraceHMFProof(reference, addresses)
+	if err != nil {
+		return VerificationResult{}, fmt.Errorf("rebuild reference proof: %w", err)
+	}
+	if err := matchTrustedRoot(trace.GlobalRoot, trustedRoot); err != nil {
+		return VerificationResult{}, fmt.Errorf("rebuild reference proof: %w", err)
+	}
+	return VerificationResult{CalculatedGlobalRoot: trace.GlobalRoot, Proof: reference, Trace: &trace}, nil
+}
+
+// splitTargetLeaves separates the requested Segment leaves from the
+// authentication nodes, returning the leaves in plan address order.
+func splitTargetLeaves(addresses []PhysicalAddress, nodes []ProofNode) ([]RequestedLeaf, []ProofNode, error) {
+	targets := make(map[NodeRef]PhysicalAddress, len(addresses))
+	for _, address := range addresses {
 		key := SegmentKey{RegionID: address.RegionID, ShardID: address.ShardID, SegmentID: address.SegmentID}
 		ref := NodeRef{Tree: segmentTree(key), Position: NodePosition{Level: 0, Index: address.LeafID}}
 		targets[ref] = address
 	}
 
 	leafHashes := make(map[PhysicalAddress][32]byte, len(targets))
-	proof := HMFProof{Plan: plan}
+	rest := make([]ProofNode, 0, len(nodes))
 	for _, node := range nodes {
 		if address, target := targets[node.Ref]; target {
 			if _, duplicate := leafHashes[address]; duplicate {
-				return HMFProof{}, fmt.Errorf("build HMF proof: duplicate target leaf %+v", address)
+				return nil, nil, fmt.Errorf("duplicate target leaf %+v", address)
 			}
 			leafHashes[address] = node.Hash
 			continue
 		}
-		proof.Nodes = append(proof.Nodes, node)
+		rest = append(rest, node)
 	}
-	for _, address := range plan.Addresses {
+	leaves := make([]RequestedLeaf, 0, len(addresses))
+	for _, address := range addresses {
 		hash, exists := leafHashes[address]
 		if !exists {
-			return HMFProof{}, fmt.Errorf("build HMF proof: target leaf missing for address %+v", address)
+			return nil, nil, fmt.Errorf("target leaf missing for address %+v", address)
 		}
-		proof.Leaves = append(proof.Leaves, RequestedLeaf{Address: address, Hash: hash})
+		leaves = append(leaves, RequestedLeaf{Address: address, Hash: hash})
 	}
-	return proof, nil
+	return leaves, rest, nil
 }
 
 func (service *Service) BuildAndCalculate(ctx context.Context,
@@ -91,7 +142,7 @@ func (service *Service) BuildAndVerify(ctx context.Context, addresses []Physical
 	if err != nil {
 		return VerificationResult{}, err
 	}
-	if _, err := VerifyHMFProofAgainstRoot(result.Proof, addresses, trustedRoot); err != nil {
+	if err := matchTrustedRoot(result.CalculatedGlobalRoot, trustedRoot); err != nil {
 		return VerificationResult{}, err
 	}
 	return result, nil

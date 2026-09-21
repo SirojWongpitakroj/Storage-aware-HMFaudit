@@ -13,8 +13,6 @@ import (
 
 type HPPReader struct {
 	session        *gocql.Session
-	segments       *SegmentRepo
-	hmf            *HMFRepo
 	maxConcurrency int
 }
 
@@ -25,122 +23,218 @@ func NewHPPReader(session *gocql.Session, maxConcurrency int) (*HPPReader, error
 	if maxConcurrency <= 0 {
 		maxConcurrency = 8
 	}
-	return &HPPReader{
-		session: session, segments: NewSegmentRepo(session), hmf: NewHMFRepo(session),
-		maxConcurrency: maxConcurrency,
-	}, nil
+	return &HPPReader{session: session, maxConcurrency: maxConcurrency}, nil
 }
 
+// LoadHierarchyMetadata reads the planner's metadata with one segment query
+// per shard partition plus one query for every shard, region and global tree
+// state, instead of one query per segment and per tree.
 func (reader *HPPReader) LoadHierarchyMetadata(ctx context.Context,
 	addresses []hpp.PhysicalAddress) (hpp.HierarchyMetadata, error) {
 
-	segments := make(map[hpp.SegmentKey]struct{})
-	shards := make(map[hpp.ShardKey]struct{})
+	segmentsByShard := make(map[hpp.ShardKey]map[int64]struct{})
 	regions := make(map[string]struct{})
 	for _, address := range addresses {
-		segments[hpp.SegmentKey{RegionID: address.RegionID, ShardID: address.ShardID, SegmentID: address.SegmentID}] = struct{}{}
-		shards[hpp.ShardKey{RegionID: address.RegionID, ShardID: address.ShardID}] = struct{}{}
+		shard := hpp.ShardKey{RegionID: address.RegionID, ShardID: address.ShardID}
+		if segmentsByShard[shard] == nil {
+			segmentsByShard[shard] = make(map[int64]struct{})
+		}
+		segmentsByShard[shard][address.SegmentID] = struct{}{}
 		regions[address.RegionID] = struct{}{}
 	}
+	treeIDs := []string{"GLOBAL"}
+	for shard := range segmentsByShard {
+		treeIDs = append(treeIDs, shardTreeID(shard))
+	}
+	for regionID := range regions {
+		treeIDs = append(treeIDs, "REGION:"+regionID)
+	}
+
 	metadata := hpp.HierarchyMetadata{
 		Segments: make(map[hpp.SegmentKey]hpp.SegmentMetadata),
 		Shards:   make(map[hpp.ShardKey]hpp.UpperTreeMetadata),
 		Regions:  make(map[string]hpp.UpperTreeMetadata),
 	}
+	states := make(map[string]treeStateRow, len(treeIDs))
 	var mutex sync.Mutex
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(reader.maxConcurrency)
-
-	for key := range segments {
-		key := key
+	for shard, segmentSet := range segmentsByShard {
+		shard := shard
+		segmentIDs := make([]int64, 0, len(segmentSet))
+		for segmentID := range segmentSet {
+			segmentIDs = append(segmentIDs, segmentID)
+		}
 		group.Go(func() error {
-			segment, err := reader.segments.GetSegment(groupCtx, key.RegionID, key.ShardID, key.SegmentID)
+			segments, err := reader.readSegments(groupCtx, shard, segmentIDs)
 			if err != nil {
 				return err
 			}
-			if segment.ShardLeafIndex == nil {
-				return fmt.Errorf("load HPP metadata: segment %+v has no shard leaf index", key)
-			}
 			mutex.Lock()
-			metadata.Segments[key] = hpp.SegmentMetadata{
-				LeafCount: segment.LeafCount, ShardLeafIndex: *segment.ShardLeafIndex, Sealed: segment.Sealed,
-			}
-			mutex.Unlock()
-			return nil
-		})
-	}
-	for key := range shards {
-		key := key
-		group.Go(func() error {
-			state, err := reader.hmf.GetTreeState(groupCtx, fmt.Sprintf("SHARD:%s:S%d", key.RegionID, key.ShardID))
-			if err != nil {
-				return err
-			}
-			if state.ParentLeafIndex == nil {
-				return fmt.Errorf("load HPP metadata: shard %+v has no region leaf index", key)
-			}
-			mutex.Lock()
-			metadata.Shards[key] = hpp.UpperTreeMetadata{
-				LeafCount: state.LeafCount, ParentLeafIndex: *state.ParentLeafIndex,
-			}
-			mutex.Unlock()
-			return nil
-		})
-	}
-	for regionID := range regions {
-		regionID := regionID
-		group.Go(func() error {
-			state, err := reader.hmf.GetTreeState(groupCtx, "REGION:"+regionID)
-			if err != nil {
-				return err
-			}
-			if state.ParentLeafIndex == nil {
-				return fmt.Errorf("load HPP metadata: region %s has no global leaf index", regionID)
-			}
-			mutex.Lock()
-			metadata.Regions[regionID] = hpp.UpperTreeMetadata{
-				LeafCount: state.LeafCount, ParentLeafIndex: *state.ParentLeafIndex,
+			for key, segment := range segments {
+				metadata.Segments[key] = segment
 			}
 			mutex.Unlock()
 			return nil
 		})
 	}
 	group.Go(func() error {
-		state, err := reader.hmf.GetTreeState(groupCtx, "GLOBAL")
+		rows, err := reader.readTreeStates(groupCtx, treeIDs)
 		if err != nil {
 			return err
 		}
 		mutex.Lock()
-		metadata.Global = hpp.UpperTreeMetadata{LeafCount: state.LeafCount}
+		for treeID, row := range rows {
+			states[treeID] = row
+		}
 		mutex.Unlock()
 		return nil
 	})
 	if err := group.Wait(); err != nil {
 		return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP hierarchy metadata: %w", err)
 	}
+
+	for shard, segmentSet := range segmentsByShard {
+		for segmentID := range segmentSet {
+			key := hpp.SegmentKey{RegionID: shard.RegionID, ShardID: shard.ShardID, SegmentID: segmentID}
+			if _, exists := metadata.Segments[key]; !exists {
+				return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: segment %+v not found", key)
+			}
+		}
+		state, exists := states[shardTreeID(shard)]
+		if !exists {
+			return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: shard %+v tree state not found", shard)
+		}
+		if state.parentLeafIndex == nil {
+			return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: shard %+v has no region leaf index", shard)
+		}
+		metadata.Shards[shard] = hpp.UpperTreeMetadata{LeafCount: state.leafCount, ParentLeafIndex: *state.parentLeafIndex}
+	}
+	for regionID := range regions {
+		state, exists := states["REGION:"+regionID]
+		if !exists {
+			return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: region %s tree state not found", regionID)
+		}
+		if state.parentLeafIndex == nil {
+			return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: region %s has no global leaf index", regionID)
+		}
+		metadata.Regions[regionID] = hpp.UpperTreeMetadata{LeafCount: state.leafCount, ParentLeafIndex: *state.parentLeafIndex}
+	}
+	global, exists := states["GLOBAL"]
+	if !exists {
+		return hpp.HierarchyMetadata{}, fmt.Errorf("load HPP metadata: global tree state not found")
+	}
+	metadata.Global = hpp.UpperTreeMetadata{LeafCount: global.leafCount}
 	return metadata, nil
 }
 
+func shardTreeID(shard hpp.ShardKey) string {
+	return fmt.Sprintf("SHARD:%s:S%d", shard.RegionID, shard.ShardID)
+}
+
+func (reader *HPPReader) readSegments(ctx context.Context, shard hpp.ShardKey,
+	segmentIDs []int64) (map[hpp.SegmentKey]hpp.SegmentMetadata, error) {
+
+	iter := reader.session.Query(`
+		SELECT segment_id, leaf_count, shard_leaf_index, sealed
+		FROM hmf_segments_by_shard
+		WHERE region_id = ? AND shard_id = ? AND segment_id IN ?;
+	`, shard.RegionID, shard.ShardID, segmentIDs).IterContext(ctx)
+	result := make(map[hpp.SegmentKey]hpp.SegmentMetadata, len(segmentIDs))
+	for {
+		var segmentID, leafCount int64
+		var shardLeafIndex *int64
+		var sealed bool
+		if !iter.Scan(&segmentID, &leafCount, &shardLeafIndex, &sealed) {
+			break
+		}
+		key := hpp.SegmentKey{RegionID: shard.RegionID, ShardID: shard.ShardID, SegmentID: segmentID}
+		if shardLeafIndex == nil {
+			_ = iter.Close()
+			return nil, fmt.Errorf("load HPP metadata: segment %+v has no shard leaf index", key)
+		}
+		result[key] = hpp.SegmentMetadata{LeafCount: leafCount, ShardLeafIndex: *shardLeafIndex, Sealed: sealed}
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+type treeStateRow struct {
+	leafCount       int64
+	parentLeafIndex *int64
+}
+
+func (reader *HPPReader) readTreeStates(ctx context.Context, treeIDs []string) (map[string]treeStateRow, error) {
+	iter := reader.session.Query(`
+		SELECT tree_id, leaf_count, parent_leaf_index
+		FROM tree_state_by_id
+		WHERE tree_id IN ?;
+	`, treeIDs).IterContext(ctx)
+	result := make(map[string]treeStateRow, len(treeIDs))
+	for {
+		var treeID string
+		var row treeStateRow
+		if !iter.Scan(&treeID, &row.leafCount, &row.parentLeafIndex) {
+			break
+		}
+		result[treeID] = row
+	}
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// FetchProofNodes reads each partition's planned nodes with one query. The
+// plan lists nodes per tree level; querying per partition with a
+// (level, node_index) IN relation keeps the reads identical while replacing
+// one round trip per level with one per partition.
 func (reader *HPPReader) FetchProofNodes(ctx context.Context, plan hpp.ProofPlan) ([]hpp.ProofNode, error) {
+	var partitions []nodePartition
+	segmentIndex := make(map[hpp.TreeRef]int)
+	for _, request := range plan.SegmentRequests {
+		index, exists := segmentIndex[request.Tree]
+		if !exists {
+			index = len(partitions)
+			segmentIndex[request.Tree] = index
+			partitions = append(partitions, nodePartition{
+				tree: request.Tree, query: segmentPartitionQuery,
+				keys: []interface{}{request.RegionID, request.ShardID, request.SegmentID},
+			})
+		}
+		partitions[index].add(request.Level, request.NodeIndexes)
+	}
+	type upperKey struct {
+		tree      hpp.TreeRef
+		scopeType string
+		scopeID   string
+		bucketID  int64
+	}
+	upperIndex := make(map[upperKey]int)
+	for _, request := range plan.UpperRequests {
+		key := upperKey{tree: request.Tree, scopeType: request.ScopeType, scopeID: request.ScopeID, bucketID: request.BucketID}
+		index, exists := upperIndex[key]
+		if !exists {
+			index = len(partitions)
+			upperIndex[key] = index
+			partitions = append(partitions, nodePartition{
+				tree: request.Tree, query: upperPartitionQuery,
+				keys: []interface{}{request.ScopeType, request.ScopeID, request.BucketID},
+			})
+		}
+		partitions[index].add(request.Level, request.NodeIndexes)
+	}
+
 	nodes := make(map[hpp.NodeRef][32]byte)
 	var mutex sync.Mutex
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(reader.maxConcurrency)
-
-	for _, request := range plan.SegmentRequests {
-		request := request
+	for _, partition := range partitions {
+		partition := partition
 		group.Go(func() error {
-			fetched, err := reader.fetchSegmentRequest(groupCtx, request)
-			if err != nil {
-				return err
-			}
-			return mergeProofNodes(&mutex, nodes, fetched)
-		})
-	}
-	for _, request := range plan.UpperRequests {
-		request := request
-		group.Go(func() error {
-			fetched, err := reader.fetchUpperRequest(groupCtx, request)
+			fetched, err := reader.fetchPartition(groupCtx, partition)
 			if err != nil {
 				return err
 			}
@@ -177,64 +271,50 @@ func (reader *HPPReader) FetchProofNodes(ctx context.Context, plan hpp.ProofPlan
 	return result, nil
 }
 
-func (reader *HPPReader) fetchSegmentRequest(ctx context.Context,
-	request hpp.SegmentRequest) ([]hpp.ProofNode, error) {
+const segmentPartitionQuery = `
+	SELECT level, node_index, node_hash
+	FROM merkle_segment_nodes
+	WHERE region_id = ? AND shard_id = ? AND segment_id = ?
+	AND (level, node_index) IN ?;
+`
 
-	query := `
-		SELECT node_index, node_hash
-		FROM merkle_segment_nodes
-		WHERE region_id = ? AND shard_id = ? AND segment_id = ?
-		AND level = ? AND node_index IN ?;
-	`
-	iter := reader.session.Query(query, request.RegionID, request.ShardID, request.SegmentID,
-		request.Level, request.NodeIndexes).IterContext(ctx)
-	nodes := make([]hpp.ProofNode, 0, len(request.NodeIndexes))
-	seen := make(map[int64]bool)
-	for {
-		var index int64
-		var hash []byte
-		if !iter.Scan(&index, &hash) {
-			break
-		}
-		converted, err := proofHash(hash)
-		if err != nil {
-			_ = iter.Close()
-			return nil, err
-		}
-		seen[index] = true
-		nodes = append(nodes, hpp.ProofNode{
-			Ref:  hpp.NodeRef{Tree: request.Tree, Position: hpp.NodePosition{Level: request.Level, Index: index}},
-			Hash: converted,
-		})
-	}
-	if err := iter.Close(); err != nil {
-		return nil, err
-	}
-	for _, index := range request.NodeIndexes {
-		if !seen[index] {
-			return nil, fmt.Errorf("segment proof node missing at level %d index %d", request.Level, index)
-		}
-	}
-	return nodes, nil
+const upperPartitionQuery = `
+	SELECT level, node_index, node_hash
+	FROM upper_merkle_nodes
+	WHERE scope_type = ? AND scope_id = ? AND bucket_id = ?
+	AND (level, node_index) IN ?;
+`
+
+// nodeKey is bound as one (level, node_index) tuple of the IN relation.
+type nodeKey struct {
+	Level int32
+	Index int64
 }
 
-func (reader *HPPReader) fetchUpperRequest(ctx context.Context,
-	request hpp.UpperRequest) ([]hpp.ProofNode, error) {
+// nodePartition collects every planned node of one Cassandra partition.
+type nodePartition struct {
+	tree      hpp.TreeRef
+	query     string
+	keys      []interface{}
+	positions []nodeKey
+}
 
-	query := `
-		SELECT node_index, node_hash
-		FROM upper_merkle_nodes
-		WHERE scope_type = ? AND scope_id = ? AND bucket_id = ?
-		AND level = ? AND node_index IN ?;
-	`
-	iter := reader.session.Query(query, request.ScopeType, request.ScopeID, request.BucketID,
-		request.Level, request.NodeIndexes).IterContext(ctx)
-	nodes := make([]hpp.ProofNode, 0, len(request.NodeIndexes))
-	seen := make(map[int64]bool)
+func (partition *nodePartition) add(level int32, indexes []int64) {
+	for _, index := range indexes {
+		partition.positions = append(partition.positions, nodeKey{Level: level, Index: index})
+	}
+}
+
+func (reader *HPPReader) fetchPartition(ctx context.Context, partition nodePartition) ([]hpp.ProofNode, error) {
+	arguments := append(append([]interface{}(nil), partition.keys...), partition.positions)
+	iter := reader.session.Query(partition.query, arguments...).IterContext(ctx)
+	nodes := make([]hpp.ProofNode, 0, len(partition.positions))
+	seen := make(map[nodeKey]bool, len(partition.positions))
 	for {
+		var level int32
 		var index int64
 		var hash []byte
-		if !iter.Scan(&index, &hash) {
+		if !iter.Scan(&level, &index, &hash) {
 			break
 		}
 		converted, err := proofHash(hash)
@@ -242,18 +322,19 @@ func (reader *HPPReader) fetchUpperRequest(ctx context.Context,
 			_ = iter.Close()
 			return nil, err
 		}
-		seen[index] = true
+		seen[nodeKey{Level: level, Index: index}] = true
 		nodes = append(nodes, hpp.ProofNode{
-			Ref:  hpp.NodeRef{Tree: request.Tree, Position: hpp.NodePosition{Level: request.Level, Index: index}},
+			Ref:  hpp.NodeRef{Tree: partition.tree, Position: hpp.NodePosition{Level: level, Index: index}},
 			Hash: converted,
 		})
 	}
 	if err := iter.Close(); err != nil {
 		return nil, err
 	}
-	for _, index := range request.NodeIndexes {
-		if !seen[index] {
-			return nil, fmt.Errorf("upper proof node missing at level %d index %d", request.Level, index)
+	for _, position := range partition.positions {
+		if !seen[position] {
+			return nil, fmt.Errorf("proof node missing for tree %+v at level %d index %d",
+				partition.tree, position.Level, position.Index)
 		}
 	}
 	return nodes, nil

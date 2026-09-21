@@ -126,9 +126,78 @@ func TestLocalizeDefaultsKToSegmentJumpSize(t *testing.T) {
 	}
 }
 
+func TestLocalizeRebuildsReferenceFromFailedProofLeaves(t *testing.T) {
+	fixture := newFixture(t)
+	failed := cloneProof(fixture.reference.Proof)
+	failed.Leaves[0].Hash[0] ^= 0xff
+	auditorRoot, err := hpp.VerifyHMFProof(failed, fixture.addresses)
+	if err != nil {
+		t.Fatalf("calculate failed root: %v", err)
+	}
+	service, _ := NewService(fixture.service)
+	fixture.nodes.fetches = nil
+	result, err := service.Localize(context.Background(), Request{
+		Addresses: fixture.addresses, AuditorGlobalRoot: auditorRoot, FailedProof: failed,
+		AnchoredGlobalRoot: fixture.reference.CalculatedGlobalRoot, K: DefaultJumpLevels,
+	})
+	if err != nil {
+		t.Fatalf("localize: %v", err)
+	}
+	if len(fixture.nodes.fetches) != 1 || fixture.nodes.fetches[0] != len(fixture.addresses) {
+		t.Fatalf("node fetches = %v, want one fetch of only the %d requested leaves",
+			fixture.nodes.fetches, len(fixture.addresses))
+	}
+	if len(result.Proof.Suspects) != 1 || result.Proof.Suspects[0].Classification != LeafMismatch {
+		t.Fatalf("suspects = %+v, want one leaf mismatch", result.Proof.Suspects)
+	}
+	if result.Proof.ReferenceProof.Leaves[0] != fixture.reference.Proof.Leaves[0] {
+		t.Fatal("reference proof does not carry the stored requested leaf")
+	}
+	if err := VerifyProof(result.Proof, fixture.addresses, fixture.reference.CalculatedGlobalRoot); err != nil {
+		t.Fatalf("verify localization proof: %v", err)
+	}
+}
+
+func TestLocalizeFallsBackToFullReferenceWhenFailedSiblingDiffers(t *testing.T) {
+	fixture := newFixture(t)
+	failed := cloneProof(fixture.reference.Proof)
+	for index := range failed.Nodes {
+		ref := failed.Nodes[index].Ref
+		if ref.Tree.Layer == hpp.LayerSegment && ref.Position.Level == 1 {
+			failed.Nodes[index].Hash[0] ^= 0xff
+			break
+		}
+	}
+	auditorRoot, err := hpp.VerifyHMFProof(failed, fixture.addresses)
+	if err != nil {
+		t.Fatalf("calculate failed root: %v", err)
+	}
+	service, _ := NewService(fixture.service)
+	fixture.nodes.fetches = nil
+	result, err := service.Localize(context.Background(), Request{
+		Addresses: fixture.addresses, AuditorGlobalRoot: auditorRoot, FailedProof: failed,
+		AnchoredGlobalRoot: fixture.reference.CalculatedGlobalRoot, K: DefaultJumpLevels,
+	})
+	if err != nil {
+		t.Fatalf("localize: %v", err)
+	}
+	if len(fixture.nodes.fetches) != 2 || fixture.nodes.fetches[1] <= len(fixture.addresses) {
+		t.Fatalf("node fetches = %v, want a leaf-only rebuild followed by a full reference build",
+			fixture.nodes.fetches)
+	}
+	if len(result.Proof.Suspects) != 1 || result.Proof.Suspects[0].Classification != AuthenticationNodeMismatch {
+		t.Fatalf("suspects = %+v, want the altered authentication node", result.Proof.Suspects)
+	}
+	if err := VerifyProof(result.Proof, fixture.addresses, fixture.reference.CalculatedGlobalRoot); err != nil {
+		t.Fatalf("verify localization proof: %v", err)
+	}
+}
+
 type fixture struct {
 	addresses []hpp.PhysicalAddress
 	reference hpp.VerificationResult
+	service   *hpp.Service
+	nodes     *countingNodes
 }
 
 func newFixture(t *testing.T) fixture {
@@ -162,7 +231,8 @@ func newFixture(t *testing.T) fixture {
 	nodes := map[hpp.TreeRef]map[hpp.NodePosition][32]byte{
 		segmentTree: segmentNodes, shardTree: shardNodes, regionTree: regionNodes, globalTree: globalNodes,
 	}
-	service, err := hpp.NewService(fixtureMetadata{metadata: metadata}, fixtureNodes{nodes: nodes})
+	counting := &countingNodes{inner: fixtureNodes{nodes: nodes}}
+	service, err := hpp.NewService(fixtureMetadata{metadata: metadata}, counting)
 	if err != nil {
 		t.Fatalf("new HPP service: %v", err)
 	}
@@ -170,7 +240,19 @@ func newFixture(t *testing.T) fixture {
 	if err != nil {
 		t.Fatalf("build reference proof: %v", err)
 	}
-	return fixture{addresses: []hpp.PhysicalAddress{address}, reference: result}
+	return fixture{addresses: []hpp.PhysicalAddress{address}, reference: result, service: service, nodes: counting}
+}
+
+// countingNodes records how many nodes each FetchProofNodes call returned.
+type countingNodes struct {
+	inner   fixtureNodes
+	fetches []int
+}
+
+func (reader *countingNodes) FetchProofNodes(ctx context.Context, plan hpp.ProofPlan) ([]hpp.ProofNode, error) {
+	nodes, err := reader.inner.FetchProofNodes(ctx, plan)
+	reader.fetches = append(reader.fetches, len(nodes))
+	return nodes, err
 }
 
 type staticReference struct{ result hpp.VerificationResult }

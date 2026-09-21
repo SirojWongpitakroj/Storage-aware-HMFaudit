@@ -36,21 +36,10 @@ type scenario struct {
 	reference       hpp.VerificationResult
 	failed          hpp.HMFProof
 	auditorRoot     [32]byte
+	trustedRoot     [32]byte
 	localizer       *localization.Service
 	localization    localization.Result
 	localizationReq localization.Request
-}
-
-type verifiedReference struct {
-	result hpp.VerificationResult
-}
-
-func (reference verifiedReference) BuildAndVerify(_ context.Context,
-	addresses []hpp.PhysicalAddress, trustedRoot [32]byte) (hpp.VerificationResult, error) {
-	if _, err := hpp.VerifyHMFProofAgainstRoot(reference.result.Proof, addresses, trustedRoot); err != nil {
-		return hpp.VerificationResult{}, err
-	}
-	return reference.result, nil
 }
 
 type measurement struct {
@@ -159,7 +148,10 @@ func prepareScenario(ctx context.Context, forest *syntheticForest,
 	if err != nil {
 		return nil, fmt.Errorf("calculate failed auditor root: %w", err)
 	}
-	localizer, err := localization.NewService(verifiedReference{result: reference})
+	// Retain the native reference workflow inside localization. The synthetic
+	// service performs planning, evidence retrieval, and authentication against
+	// the in-memory benchmark hierarchy.
+	localizer, err := localization.NewService(forest.service)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +168,7 @@ func prepareScenario(ctx context.Context, forest *syntheticForest,
 	}
 	return &scenario{
 		placement: placement, batchSize: batchSize, addresses: addresses, reference: reference,
-		failed: failed, auditorRoot: auditorRoot, localizer: localizer,
+		failed: failed, auditorRoot: auditorRoot, trustedRoot: forest.root, localizer: localizer,
 		localization: localized, localizationReq: request,
 	}, nil
 }
@@ -278,7 +270,7 @@ func execute(ctx context.Context, scenario *scenario, operation string) error {
 	switch operation {
 	case "hmf_verification":
 		root, err := hpp.VerifyHMFProofAgainstRoot(
-			scenario.reference.Proof, scenario.addresses, scenario.reference.CalculatedGlobalRoot,
+			scenario.reference.Proof, scenario.addresses, scenario.trustedRoot,
 		)
 		if err != nil {
 			return err
@@ -292,7 +284,7 @@ func execute(ctx context.Context, scenario *scenario, operation string) error {
 		benchmarkSink = result.CalculatedReferenceRoot
 	case "localization_proof_verification":
 		if err := localization.VerifyProof(scenario.localization.Proof,
-			scenario.addresses, scenario.reference.CalculatedGlobalRoot); err != nil {
+			scenario.addresses, scenario.trustedRoot); err != nil {
 			return err
 		}
 		benchmarkSink = scenario.localization.Proof.ReferenceGlobalRoot

@@ -14,6 +14,7 @@ import (
 	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/checkpoint"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/localization"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/services"
 )
 
@@ -71,7 +72,7 @@ func TestHandlerServesLocatorAndHMFProofs(t *testing.T) {
 	}
 
 	localizeBody, err := json.Marshal(localizationRequest{
-		CheckpointSequence: 4, AuditorGlobalRoot: hashHex([32]byte{9}), K: 15,
+		CheckpointSequence: 4, AuditorGlobalRoot: hashHex([32]byte{9}), K: localization.DefaultJumpLevels,
 		Addresses:   []physicalAddress{{RegionID: "R0", ShardID: 1, SegmentID: 2, LeafID: 3}},
 		FailedProof: hmfProof{},
 	})
@@ -85,7 +86,7 @@ func TestHandlerServesLocatorAndHMFProofs(t *testing.T) {
 	if localizeRecorder.Code != http.StatusOK {
 		t.Fatalf("localization status = %d, body=%s", localizeRecorder.Code, localizeRecorder.Body.String())
 	}
-	if service.localizationK != 15 || service.localizationSequence != 4 {
+	if service.localizationK != localization.DefaultJumpLevels || service.localizationSequence != 4 {
 		t.Fatalf("localization request = sequence %d k %d", service.localizationSequence, service.localizationK)
 	}
 }
