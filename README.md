@@ -41,6 +41,18 @@ Dashed arrows show the ingestion path; solid arrows show verification and tamper
 
 **Status: in progress.** Benchmarking against the baseline systems is still under way, so no final results are published yet. The latency harness (`benchmarks/latency`) is already in place. It measures P50/P95/P99 across batch sizes, placements and tampered-log counts.
 
+**Verification latency**
+
+<img src="assets/verification_latency.png" alt="Verification latency" width="500">
+
+**Localization latency**
+
+<img src="assets/localization_latency.png" alt="Localization latency" width="500">
+
+**Ablation latency**
+
+<img src="assets/ablation_latency.png" alt="Ablation latency" width="500">
+
 ## Layout
 
 ```text
