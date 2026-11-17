@@ -44,6 +44,7 @@ func (r *LogRepository) Insert(ctx context.Context, log domain.Log) error {
 	return nil
 }
 
+// GetByLogID returns open rows. The caller must close them after reading.
 func (r *LogRepository) GetByLogID(ctx context.Context, ids []uuid.UUID) (pgx.Rows, error) {
 	rows, err := r.db.Query(ctx,
 		`
@@ -61,7 +62,5 @@ func (r *LogRepository) GetByLogID(ctx context.Context, ids []uuid.UUID) (pgx.Ro
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	return rows, nil
 }

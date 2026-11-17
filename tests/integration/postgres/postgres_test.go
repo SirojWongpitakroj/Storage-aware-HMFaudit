@@ -43,4 +43,28 @@ func TestInsert(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("row not found after insert: err=%v count=%d", err, count)
 	}
+
+	rows, err := repo.GetByLogID(ctx, []uuid.UUID{logID})
+	if err != nil {
+		t.Fatalf("GetByLogID failed: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("GetByLogID returned no readable row: %v", rows.Err())
+	}
+	var gotID uuid.UUID
+	var ciphertext, nonce, tag, ad []byte
+	if err := rows.Scan(&gotID, &ciphertext, &nonce, &tag, &ad); err != nil {
+		t.Fatalf("scan returned row: %v", err)
+	}
+	if gotID != logID || string(ciphertext) != "ct" || string(nonce) != "nonce" ||
+		string(tag) != "tag" || string(ad) != "ad" {
+		t.Fatalf("GetByLogID returned unexpected log data")
+	}
+	if rows.Next() {
+		t.Fatal("GetByLogID returned more than one row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate returned rows: %v", err)
+	}
 }

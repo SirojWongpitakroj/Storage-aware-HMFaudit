@@ -61,6 +61,70 @@ func (w *ALLUpdateWriter) PersistUpdate(ctx context.Context, update all.LocatorU
 	return w.repo.SaveLocatorUpdate(ctx, pages, state)
 }
 
+// PersistSnapshot writes a complete tree with bounded page memory, publishing
+// its root only after every page has been stored. This is useful when seeding a
+// large fixture whose final pages would be too large to marshal in one update.
+func (w *ALLUpdateWriter) PersistSnapshot(ctx context.Context, tree *all.LocatorTree) error {
+	if tree == nil || tree.RootPage == nil {
+		return fmt.Errorf("persist ALL snapshot: tree and root page are required")
+	}
+	const pageChunkSize = 256
+	seen := make(map[int64]struct{})
+	stack := []*all.Page{tree.RootPage}
+	chunk := make([]all.Page, 0, pageChunkSize)
+	flush := func() error {
+		if len(chunk) == 0 {
+			return nil
+		}
+		pages, err := w.pages(chunk)
+		if err != nil {
+			return err
+		}
+		if err := w.repo.UpsertPages(ctx, pages); err != nil {
+			return err
+		}
+		chunk = chunk[:0]
+		return nil
+	}
+	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		page := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if page == nil {
+			continue
+		}
+		if _, exists := seen[page.PageID]; exists {
+			continue
+		}
+		seen[page.PageID] = struct{}{}
+		chunk = append(chunk, *page)
+		if len(chunk) == pageChunkSize {
+			if err := flush(); err != nil {
+				return fmt.Errorf("persist ALL snapshot pages: %w", err)
+			}
+		}
+		for _, child := range page.Children {
+			stack = append(stack, child)
+		}
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("persist ALL snapshot pages: %w", err)
+	}
+	state := ALLTreeState{
+		TreeID: w.treeID, RootPageID: tree.RootPageID,
+		RootHash: copyHash(tree.RootHash), NextPageID: tree.NextPageID,
+		TreeHeight: int32(tree.Height), TreeOrder: int32(w.treeOrder),
+		RecordCount: tree.LeafCount, PageCount: tree.NextPageID,
+		PagesPerBucket: int32(w.pagesPerBucket), UpdatedAt: time.Now().UTC(),
+	}
+	if err := w.repo.UpsertTreeState(ctx, state); err != nil {
+		return fmt.Errorf("persist ALL snapshot state: %w", err)
+	}
+	return nil
+}
+
 // PersistUpdates consumes ALL.Updates in order until cancellation or failure.
 func (w *ALLUpdateWriter) PersistUpdates(ctx context.Context, updates <-chan all.LocatorUpdate) error {
 	for {

@@ -179,12 +179,12 @@ func committedRoot(tree TreeRef, leafCount int64, rawRoot [32]byte) [32]byte {
 }
 
 func validateTreePlanShape(plan TreePlan) error {
-	targets := make(map[int64]struct{}, len(plan.Targets))
+	targets := make(map[int64]int64, len(plan.Targets))
 	for _, target := range plan.Targets {
 		if _, duplicate := targets[target]; duplicate {
 			return fmt.Errorf("verify HMF proof: duplicate target %d for tree %+v", target, plan.Tree)
 		}
-		targets[target] = struct{}{}
+		targets[target] = 1
 	}
 	canonical, err := planTree(plan.Tree, plan.LeafCount, targets)
 	if err != nil {

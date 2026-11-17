@@ -14,6 +14,62 @@ import (
 type HPPReader struct {
 	session        *gocql.Session
 	maxConcurrency int
+
+	// Stats is an optional benchmark-only hook that observes retrieval-call
+	// counts. It is nil in production, so adding it does not change retrieval
+	// behavior or cost; a benchmark sets HPPReader.Stats to count Cassandra
+	// reads and partitions touched per FetchProofNodes/FetchProofNodesUngrouped
+	// call without altering their query logic.
+	Stats *ReadStats
+}
+
+// ReadStats accumulates benchmark-only Cassandra retrieval counters. Reads
+// counts every query issued; Partitions counts the distinct partition keys
+// those queries touched (several reads may share a partition, as in the
+// NO_PARTITION_AWARE ablation's point-query retrieval). RequestedKeys counts
+// every individual (level, node_index) key occurrence submitted across all
+// queries' arguments, including exact duplicates within one query's IN list
+// (the NO_DEDUP ablation's expanded requests); RowsReturned counts the actual
+// distinct rows Cassandra scanned back. Comparing the two lets a caller state
+// precisely when a duplicate request cost no extra physical I/O (Cassandra
+// returning a matched row once regardless of how many times its key appears
+// in an IN list) rather than assuming repeated requests mean repeated reads.
+type ReadStats struct {
+	mu            sync.Mutex
+	Reads         int64
+	RequestedKeys int64
+	RowsReturned  int64
+	partitions    map[string]struct{}
+}
+
+func (stats *ReadStats) addRead(partitionKey string, requestedKeys, rowsReturned int) {
+	if stats == nil {
+		return
+	}
+	stats.mu.Lock()
+	stats.Reads++
+	stats.RequestedKeys += int64(requestedKeys)
+	stats.RowsReturned += int64(rowsReturned)
+	if stats.partitions == nil {
+		stats.partitions = make(map[string]struct{})
+	}
+	stats.partitions[partitionKey] = struct{}{}
+	stats.mu.Unlock()
+}
+
+// Snapshot returns the current counters. Safe to call concurrently with
+// retrieval; callers typically snapshot before and after one call and take
+// the difference for Reads, RequestedKeys, and RowsReturned (Partitions is
+// already the distinct count for this Stats instance's whole lifetime, so
+// callers should use a fresh ReadStats per measured call rather than diffing
+// Partitions).
+func (stats *ReadStats) Snapshot() (reads, partitions, requestedKeys, rowsReturned int64) {
+	if stats == nil {
+		return 0, 0, 0, 0
+	}
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	return stats.Reads, int64(len(stats.partitions)), stats.RequestedKeys, stats.RowsReturned
 }
 
 func NewHPPReader(session *gocql.Session, maxConcurrency int) (*HPPReader, error) {
@@ -337,6 +393,7 @@ func (reader *HPPReader) fetchPartition(ctx context.Context, partition nodeParti
 				partition.tree, position.Level, position.Index)
 		}
 	}
+	reader.Stats.addRead(fmt.Sprintf("%s|%v", partition.query, partition.keys), len(partition.positions), len(nodes))
 	return nodes, nil
 }
 

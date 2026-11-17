@@ -13,14 +13,14 @@ import (
 
 func TestPlanTreeDeduplicatesSharedPathsAndPromotesOddNodes(t *testing.T) {
 	tree := TreeRef{Layer: LayerSegment, RegionID: "R0", ShardID: 0, SegmentID: 1}
-	shared, err := planTree(tree, 4, map[int64]struct{}{1: {}, 2: {}})
+	shared, err := planTree(tree, 4, map[int64]int64{1: 1, 2: 1})
 	if err != nil {
 		t.Fatalf("plan shared tree: %v", err)
 	}
 	wantShared := []NodePosition{{Level: 0, Index: 0}, {Level: 0, Index: 3}}
 	assertPositions(t, shared.Required, wantShared)
 
-	odd, err := planTree(tree, 5, map[int64]struct{}{4: {}})
+	odd, err := planTree(tree, 5, map[int64]int64{4: 1})
 	if err != nil {
 		t.Fatalf("plan odd tree: %v", err)
 	}
@@ -229,11 +229,11 @@ func TestRandomMultiproofsMatchCompleteTreeRoots(t *testing.T) {
 		}
 		wantRoot, allNodes := testTree(leaves)
 		for iteration := 0; iteration < 20; iteration++ {
-			targets := make(map[int64]struct{})
+			targets := make(map[int64]int64)
 			for len(targets) == 0 {
 				for index := range leaves {
 					if random.Intn(4) == 0 {
-						targets[int64(index)] = struct{}{}
+						targets[int64(index)] = 1
 					}
 				}
 			}

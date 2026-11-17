@@ -20,7 +20,15 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 		return ProofPlan{}, fmt.Errorf("HPP: at least one physical address is required")
 	}
 
-	segmentTargets := make(map[SegmentKey]map[int64]struct{})
+	// Every target map below is index -> weight, where weight is the number of
+	// this batch's original addresses whose independent authentication path
+	// would pass through that index -- not just a presence set. A segment's
+	// weight starts as one per distinct requested leaf; each layer above sums
+	// its children's weights before becoming a single target of the next
+	// layer's planTree call, so a required node's occurrence count (see
+	// TreePlan.RequiredOccurrences) always reflects genuine per-address
+	// sharing, never just per-distinct-child-key sharing.
+	segmentTargets := make(map[SegmentKey]map[int64]int64)
 	for _, address := range normalized {
 		key := SegmentKey{RegionID: address.RegionID, ShardID: address.ShardID, SegmentID: address.SegmentID}
 		segment, exists := metadata.Segments[key]
@@ -35,13 +43,14 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 				address.LeafID, key, segment.LeafCount)
 		}
 		if segmentTargets[key] == nil {
-			segmentTargets[key] = make(map[int64]struct{})
+			segmentTargets[key] = make(map[int64]int64)
 		}
-		segmentTargets[key][address.LeafID] = struct{}{}
+		segmentTargets[key][address.LeafID]++
 	}
 
 	plan := ProofPlan{Addresses: normalized}
 	shardChildren := make(map[ShardKey]map[int64]TreeRef)
+	shardWeights := make(map[ShardKey]map[int64]int64)
 	for key, targets := range segmentTargets {
 		segment := metadata.Segments[key]
 		tree := segmentTree(key)
@@ -54,26 +63,28 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 		shardKey := ShardKey{RegionID: key.RegionID, ShardID: key.ShardID}
 		if shardChildren[shardKey] == nil {
 			shardChildren[shardKey] = make(map[int64]TreeRef)
+			shardWeights[shardKey] = make(map[int64]int64)
 		}
 		if existing, duplicate := shardChildren[shardKey][segment.ShardLeafIndex]; duplicate && existing != tree {
 			return ProofPlan{}, fmt.Errorf("HPP: segments share shard leaf index %d in %+v", segment.ShardLeafIndex, shardKey)
 		}
 		shardChildren[shardKey][segment.ShardLeafIndex] = tree
+		shardWeights[shardKey][segment.ShardLeafIndex] = sumWeights(targets)
 	}
 
 	regionChildren := make(map[string]map[int64]TreeRef)
+	regionWeights := make(map[string]map[int64]int64)
 	for key, children := range shardChildren {
 		metadataForTree, exists := metadata.Shards[key]
 		if !exists {
 			return ProofPlan{}, fmt.Errorf("HPP: metadata missing for shard %+v", key)
 		}
-		targets := make(map[int64]struct{}, len(children))
+		targets := shardWeights[key]
 		parent := shardTree(key)
 		for index, child := range children {
 			if index < 0 || index >= metadataForTree.LeafCount {
 				return ProofPlan{}, fmt.Errorf("HPP: segment leaf index %d outside shard %+v", index, key)
 			}
-			targets[index] = struct{}{}
 			plan.ParentLinks = append(plan.ParentLinks, ParentLink{Child: child, Parent: parent, ParentLeafIndex: index})
 		}
 		treePlan, err := planTree(parent, metadataForTree.LeafCount, targets)
@@ -84,27 +95,29 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 
 		if regionChildren[key.RegionID] == nil {
 			regionChildren[key.RegionID] = make(map[int64]TreeRef)
+			regionWeights[key.RegionID] = make(map[int64]int64)
 		}
 		if existing, duplicate := regionChildren[key.RegionID][metadataForTree.ParentLeafIndex]; duplicate && existing != parent {
 			return ProofPlan{}, fmt.Errorf("HPP: shards share region leaf index %d in region %s",
 				metadataForTree.ParentLeafIndex, key.RegionID)
 		}
 		regionChildren[key.RegionID][metadataForTree.ParentLeafIndex] = parent
+		regionWeights[key.RegionID][metadataForTree.ParentLeafIndex] = sumWeights(targets)
 	}
 
 	globalChildren := make(map[int64]TreeRef)
+	globalWeights := make(map[int64]int64)
 	for regionID, children := range regionChildren {
 		metadataForTree, exists := metadata.Regions[regionID]
 		if !exists {
 			return ProofPlan{}, fmt.Errorf("HPP: metadata missing for region %s", regionID)
 		}
-		targets := make(map[int64]struct{}, len(children))
+		targets := regionWeights[regionID]
 		parent := regionTree(regionID)
 		for index, child := range children {
 			if index < 0 || index >= metadataForTree.LeafCount {
 				return ProofPlan{}, fmt.Errorf("HPP: shard leaf index %d outside region %s", index, regionID)
 			}
-			targets[index] = struct{}{}
 			plan.ParentLinks = append(plan.ParentLinks, ParentLink{Child: child, Parent: parent, ParentLeafIndex: index})
 		}
 		treePlan, err := planTree(parent, metadataForTree.LeafCount, targets)
@@ -117,21 +130,20 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 			return ProofPlan{}, fmt.Errorf("HPP: regions share global leaf index %d", metadataForTree.ParentLeafIndex)
 		}
 		globalChildren[metadataForTree.ParentLeafIndex] = parent
+		globalWeights[metadataForTree.ParentLeafIndex] = sumWeights(targets)
 	}
 
 	if metadata.Global.LeafCount <= 0 {
 		return ProofPlan{}, fmt.Errorf("HPP: global tree metadata is invalid")
 	}
-	globalTargets := make(map[int64]struct{}, len(globalChildren))
 	global := globalTree()
 	for index, child := range globalChildren {
 		if index < 0 || index >= metadata.Global.LeafCount {
 			return ProofPlan{}, fmt.Errorf("HPP: region leaf index %d outside global tree", index)
 		}
-		globalTargets[index] = struct{}{}
 		plan.ParentLinks = append(plan.ParentLinks, ParentLink{Child: child, Parent: global, ParentLeafIndex: index})
 	}
-	globalPlan, err := planTree(global, metadata.Global.LeafCount, globalTargets)
+	globalPlan, err := planTree(global, metadata.Global.LeafCount, globalWeights)
 	if err != nil {
 		return ProofPlan{}, err
 	}
@@ -148,15 +160,32 @@ func (planner *Planner) Plan(addresses []PhysicalAddress, metadata HierarchyMeta
 	return plan, nil
 }
 
-func planTree(tree TreeRef, leafCount int64, targets map[int64]struct{}) (TreePlan, error) {
+// sumWeights totals a target-weight map's values -- the number of original
+// addresses feeding into all of that map's targets combined.
+func sumWeights(weights map[int64]int64) int64 {
+	var total int64
+	for _, weight := range weights {
+		total += weight
+	}
+	return total
+}
+
+// planTree computes the joint merge-walk for one tree. targetWeights maps
+// each active leaf/child index to the number of this batch's original
+// addresses whose independent authentication path would pass through it --
+// ordinarily 1 per distinct index, but greater than 1 when a caller has
+// already collapsed several addresses (or several lower-layer children) into
+// one target of this tree, such as Planner.Plan's shard/region/global-layer
+// calls.
+func planTree(tree TreeRef, leafCount int64, targetWeights map[int64]int64) (TreePlan, error) {
 	if leafCount <= 0 {
 		return TreePlan{}, fmt.Errorf("HPP: tree %+v must contain at least one leaf", tree)
 	}
-	if len(targets) == 0 {
+	if len(targetWeights) == 0 {
 		return TreePlan{}, fmt.Errorf("HPP: tree %+v has no target leaves", tree)
 	}
-	active := make([]int64, 0, len(targets))
-	for index := range targets {
+	active := make([]int64, 0, len(targetWeights))
+	for index := range targetWeights {
 		if index < 0 || index >= leafCount {
 			return TreePlan{}, fmt.Errorf("HPP: target leaf %d outside tree %+v", index, tree)
 		}
@@ -165,33 +194,56 @@ func planTree(tree TreeRef, leafCount int64, targets map[int64]struct{}) (TreePl
 	sort.Slice(active, func(left, right int) bool { return active[left] < active[right] })
 	result := TreePlan{Tree: tree, LeafCount: leafCount, Targets: append([]int64(nil), active...)}
 
+	// weights[i] tracks how many of this batch's original addresses have
+	// merged into active[i] so far, seeded from targetWeights. Whenever two
+	// active siblings merge into one parent, their weights sum. When only one
+	// sibling is active, the OTHER (required) sibling's occurrence count is
+	// exactly that active sibling's weight -- the number of original
+	// addresses whose independent path would need it. This is computed in the
+	// same single joint merge-walk that produces Required, so it costs no
+	// extra tree traversal and never re-derives any address's path
+	// independently.
+	weights := make([]int64, len(active))
+	for index, position := range active {
+		weights[index] = targetWeights[position]
+	}
+
 	// Walking each level's sorted active indexes emits Required already in
 	// canonical (level, index) order.
 	next := make([]int64, 0, len(active))
+	nextWeights := make([]int64, 0, len(active))
 	width := leafCount
 	level := int32(0)
 	for width > 1 {
 		next = next[:0]
+		nextWeights = nextWeights[:0]
 		for position := 0; position < len(active); {
 			parent := active[position] / 2
 			left, right := parent*2, parent*2+1
+			var leftWeight, rightWeight int64
 			haveLeft := active[position] == left
 			if haveLeft {
+				leftWeight = weights[position]
 				position++
 			}
 			haveRight := position < len(active) && active[position] == right
 			if haveRight {
+				rightWeight = weights[position]
 				position++
 			}
 			if !haveLeft {
 				result.Required = append(result.Required, NodePosition{Level: level, Index: left})
+				result.RequiredOccurrences = append(result.RequiredOccurrences, rightWeight)
 			}
 			if !haveRight && right < width {
 				result.Required = append(result.Required, NodePosition{Level: level, Index: right})
+				result.RequiredOccurrences = append(result.RequiredOccurrences, leftWeight)
 			}
 			next = append(next, parent)
+			nextWeights = append(nextWeights, leftWeight+rightWeight)
 		}
 		active, next = next, active
+		weights, nextWeights = nextWeights, weights
 		width = (width + 1) / 2
 		level++
 	}

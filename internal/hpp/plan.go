@@ -74,6 +74,15 @@ type TreePlan struct {
 	LeafCount int64          `json:"leaf_count"`
 	Targets   []int64        `json:"targets"`
 	Required  []NodePosition `json:"required"`
+	// RequiredOccurrences[i] is the number of this batch's target leaves whose
+	// classic, independently-derived authentication path would require
+	// Required[i] -- i.e. that node's logical (pre-dedup) occurrence count.
+	// It is computed for free during the same joint merge-walk that produces
+	// Required, without re-deriving any leaf's path independently: len(Required)
+	// always equals the number of distinct required node identities, while
+	// sum(RequiredOccurrences) equals what an ablated, deduplication-free
+	// retrieval would have requested. Always the same length as Required.
+	RequiredOccurrences []int64 `json:"required_occurrences"`
 }
 
 type ParentLink struct {

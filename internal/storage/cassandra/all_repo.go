@@ -6,6 +6,14 @@ import (
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	"golang.org/x/sync/errgroup"
+)
+
+// Keep each unlogged batch comfortably below Cassandra's request timeout and
+// avoid flooding the coordinator when a full locator tree is seeded.
+const (
+	allPageWriteBatchSize   = 32
+	allPageWriteConcurrency = 8
 )
 
 type ALLPage struct {
@@ -121,40 +129,34 @@ func (r *ALLRepo) UpsertPages(ctx context.Context, pages []ALLPage) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 		`
 
-	results := make(chan error, len(partitions))
-
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(allPageWriteConcurrency)
 	for _, partitionPages := range partitions {
-		go func(partitionPages []ALLPage) {
-			batch := r.session.Batch(gocql.UnloggedBatch)
-
-			for _, page := range partitionPages {
-				batch = batch.Query(
-					query,
-					page.TreeID,
-					page.BucketID,
-					page.PageID,
-					page.IsLeaf,
-					page.ParentPageID,
-					page.NextPageID,
-					page.PageData,
-					page.FormatVersion,
-					page.PageHash,
-				)
-			}
-
-			results <- batch.ExecContext(ctx)
-		}(partitionPages)
-	}
-
-	var firstErr error
-	for range partitions {
-		if err := <-results; err != nil && firstErr == nil {
-			firstErr = err
+		for start := 0; start < len(partitionPages); start += allPageWriteBatchSize {
+			end := min(start+allPageWriteBatchSize, len(partitionPages))
+			batchPages := partitionPages[start:end]
+			group.Go(func() error {
+				batch := r.session.Batch(gocql.UnloggedBatch)
+				for _, page := range batchPages {
+					batch = batch.Query(
+						query,
+						page.TreeID,
+						page.BucketID,
+						page.PageID,
+						page.IsLeaf,
+						page.ParentPageID,
+						page.NextPageID,
+						page.PageData,
+						page.FormatVersion,
+						page.PageHash,
+					)
+				}
+				return batch.ExecContext(groupCtx)
+			})
 		}
 	}
-
-	if firstErr != nil {
-		return fmt.Errorf("upsert batch pages: %w", firstErr)
+	if err := group.Wait(); err != nil {
+		return fmt.Errorf("upsert batch pages: %w", err)
 	}
 
 	return nil
