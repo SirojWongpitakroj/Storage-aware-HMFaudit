@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 	"uuid"
 
+	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/localization"
 	cassandrastore "github.com/SirojWongpitakroj/hmf-audit/internal/storage/cassandra"
@@ -24,6 +26,42 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const (
+	fairHMFSeedNodeBatchSize = 32
+	fairHMFSeedConcurrency   = 4
+	fairHMFSeedWriteAttempts = 5
+)
+
+// The fixture writes immutable, idempotent rows before any benchmark timer
+// starts. Retry only Cassandra's transient write failures; a timed-out batch
+// may already have landed, and repeating it is safe for these rows.
+func fairRetrySeedWrite(ctx context.Context, write func() error) error {
+	for attempt := 1; attempt <= fairHMFSeedWriteAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := write()
+		if err == nil {
+			return nil
+		}
+		var timeout *gocql.RequestErrWriteTimeout
+		var unavailable *gocql.RequestErrUnavailable
+		var overloaded *gocql.RequestErrOverloaded
+		if attempt == fairHMFSeedWriteAttempts ||
+			!(errors.As(err, &timeout) || errors.As(err, &unavailable) ||
+				errors.As(err, &overloaded) || errors.Is(err, gocql.ErrTimeoutNoResponse)) {
+			return fmt.Errorf("seed write failed after %d attempt(s): %w", attempt, err)
+		}
+		delay := time.Duration(1<<(attempt-1)) * 100 * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	panic("unreachable")
+}
+
 type persistentFairHMFFixture struct {
 	forest         *syntheticForest
 	postgres       *pgxpool.Pool
@@ -32,6 +70,9 @@ type persistentFairHMFFixture struct {
 	tampered       []hpp.PhysicalAddress
 	trustedRoot    [32]byte
 	hppConcurrency int
+
+	allRepo     *cassandrastore.ALLRepo
+	locatorRoot [32]byte
 }
 
 // TestMain closes the shared fixture's connections once every benchmark in
@@ -56,7 +97,12 @@ var fairHMFShared struct {
 	err     error
 }
 
-func sharedFairHMFFixture(b *testing.B) *persistentFairHMFFixture {
+// sharedFairHMFFixture and newPersistentFairHMFFixture take testing.TB (not
+// *testing.B) purely so both the go test -bench functions in this package and
+// the ablation harness's plain *testing.T function can share one fixture;
+// every call they make (Helper/Fatal/Fatalf) is part of the testing.TB
+// interface, so this is a behavior-preserving widening.
+func sharedFairHMFFixture(b testing.TB) *persistentFairHMFFixture {
 	b.Helper()
 	fairHMFShared.once.Do(func() {
 		fairHMFShared.fixture, fairHMFShared.err = newPersistentFairHMFFixture(b)
@@ -67,7 +113,7 @@ func sharedFairHMFFixture(b *testing.B) *persistentFairHMFFixture {
 	return fairHMFShared.fixture
 }
 
-func newPersistentFairHMFFixture(b *testing.B) (*persistentFairHMFFixture, error) {
+func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error) {
 	b.Helper()
 	if os.Getenv("FAIR_PERSISTENCE") != "1" {
 		b.Fatal("FAIR_PERSISTENCE=1 is required; use systems/run-fair-benchmarks.ps1")
@@ -83,14 +129,18 @@ func newPersistentFairHMFFixture(b *testing.B) (*persistentFairHMFFixture, error
 	if err != nil {
 		b.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	// Connections should fail fast, but a 10M-record fixture can take far
+	// longer than ten minutes to persist. In particular, ALL must receive a
+	// fresh setup deadline after HMF node persistence completes; sharing one
+	// context makes ALL fail immediately when HMF seeding used the budget.
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancelConnect()
 
 	postgresDSN := os.Getenv("FAIR_POSTGRES_DSN")
 	if postgresDSN == "" {
 		b.Fatal("FAIR_POSTGRES_DSN is unset")
 	}
-	pool, err := postgresql.NewClient(ctx, postgresDSN)
+	pool, err := postgresql.NewClient(connectCtx, postgresDSN)
 	if err != nil {
 		b.Fatalf("connect PostgreSQL: %v", err)
 	}
@@ -103,7 +153,7 @@ func newPersistentFairHMFFixture(b *testing.B) (*persistentFairHMFFixture, error
 	if host == "" {
 		b.Fatal("FAIR_CASSANDRA_HOST is unset")
 	}
-	session, err := cassandrastore.NewSession(ctx, cassandrastore.Config{
+	session, err := cassandrastore.NewSession(connectCtx, cassandrastore.Config{
 		Hosts: []string{host}, Port: port, Keyspace: "hmf_audit", Datacenter: "datacenter1",
 	})
 	if err != nil {
@@ -115,8 +165,19 @@ func newPersistentFairHMFFixture(b *testing.B) (*persistentFairHMFFixture, error
 		forest: forest, postgres: pool, cassandra: session, trustedRoot: forest.root,
 		hppConcurrency: hppConcurrency,
 	}
-	if err := fixture.seed(ctx); err != nil {
+	hmfSeedCtx, cancelHMFSeed := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancelHMFSeed()
+	if err := fixture.seed(hmfSeedCtx); err != nil {
 		return nil, fmt.Errorf("seed persistent HMF fixture: %w", err)
+	}
+	// ALL only needs the layout. Release the setup-only HMF hierarchy before
+	// constructing the 10M-entry locator tree to reduce peak memory pressure.
+	fixture.forest.trees = nil
+	fixture.forest.metadata = hpp.HierarchyMetadata{}
+	allSeedCtx, cancelALLSeed := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancelALLSeed()
+	if err := fixture.seedALL(allSeedCtx); err != nil {
+		return nil, fmt.Errorf("seed persistent ALL fixture: %w", err)
 	}
 	reader, err := cassandrastore.NewHPPReader(session, hppConcurrency)
 	if err != nil {
@@ -131,10 +192,6 @@ func newPersistentFairHMFFixture(b *testing.B) (*persistentFairHMFFixture, error
 	if err != nil {
 		b.Fatal(err)
 	}
-	// Cassandra is now the only hierarchy/proof source used by requests.
-	// Release the setup-only in-memory tree and metadata.
-	fixture.forest.trees = nil
-	fixture.forest.metadata = hpp.HierarchyMetadata{}
 	return fixture, nil
 }
 
@@ -156,51 +213,64 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	segmentRepo := cassandrastore.NewSegmentRepo(fixture.cassandra)
 	hmfRepo := cassandrastore.NewHMFRepo(fixture.cassandra)
 	now := time.Now().UTC()
-	// Segment trees are independent partitions; write them concurrently so
-	// setup is not one round trip at a time.
+	// Segment trees are independent partitions. Keep each batch small and the
+	// worker count bounded so Cassandra does not time out under 10M-node setup.
 	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(16)
+	group.SetLimit(fairHMFSeedConcurrency)
 	for tree, data := range fixture.forest.trees {
-		switch tree.Layer {
-		case hpp.LayerSegment:
-			group.Go(func() error {
-				leafIndex := tree.SegmentID
-				sealedAt := now
-				root := data.root()
-				if err := segmentRepo.UpsertSegment(groupCtx, cassandrastore.SegmentMetadata{
-					RegionID: tree.RegionID, ShardID: tree.ShardID, SegmentID: tree.SegmentID,
-					SegmentRoot: root[:], LeafCount: int64(len(data.levels[0])),
-					ShardLeafIndex: &leafIndex, MaxLeaves: int32(len(data.levels[0])),
-					Sealed: true, CreatedAt: now, SealedAt: &sealedAt,
+		if tree.Layer != hpp.LayerSegment {
+			continue
+		}
+		group.Go(func() error {
+			leafIndex := tree.SegmentID
+			sealedAt := now
+			root := data.root()
+			metadata := cassandrastore.SegmentMetadata{
+				RegionID: tree.RegionID, ShardID: tree.ShardID, SegmentID: tree.SegmentID,
+				SegmentRoot: root[:], LeafCount: int64(len(data.levels[0])),
+				ShardLeafIndex: &leafIndex, MaxLeaves: int32(len(data.levels[0])),
+				Sealed: true, CreatedAt: now, SealedAt: &sealedAt,
+			}
+			if err := fairRetrySeedWrite(groupCtx, func() error {
+				return segmentRepo.UpsertSegment(groupCtx, metadata)
+			}); err != nil {
+				return err
+			}
+			nodes := make([]cassandrastore.SegmentNode, 0, fairHMFSeedNodeBatchSize)
+			flush := func() error {
+				if len(nodes) == 0 {
+					return nil
+				}
+				if err := fairRetrySeedWrite(groupCtx, func() error {
+					return segmentRepo.UpsertNodes(groupCtx, nodes)
 				}); err != nil {
 					return err
 				}
-				nodes := make([]cassandrastore.SegmentNode, 0, 128)
-				flush := func() error {
-					if len(nodes) == 0 {
-						return nil
-					}
-					if err := segmentRepo.UpsertNodes(groupCtx, nodes); err != nil {
-						return err
-					}
-					nodes = nodes[:0]
-					return nil
-				}
-				for level, hashes := range data.levels {
-					for index, hash := range hashes {
-						nodes = append(nodes, cassandrastore.SegmentNode{
-							RegionID: tree.RegionID, ShardID: tree.ShardID, SegmentID: tree.SegmentID,
-							Level: int32(level), NodeIndex: int64(index), NodeHash: append([]byte(nil), hash[:]...),
-						})
-						if len(nodes) == cap(nodes) {
-							if err := flush(); err != nil {
-								return err
-							}
+				nodes = nodes[:0]
+				return nil
+			}
+			for level, hashes := range data.levels {
+				for index, hash := range hashes {
+					nodes = append(nodes, cassandrastore.SegmentNode{
+						RegionID: tree.RegionID, ShardID: tree.ShardID, SegmentID: tree.SegmentID,
+						Level: int32(level), NodeIndex: int64(index), NodeHash: append([]byte(nil), hash[:]...),
+					})
+					if len(nodes) == cap(nodes) {
+						if err := flush(); err != nil {
+							return err
 						}
 					}
 				}
-				return flush()
-			})
+			}
+			return flush()
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	// Upper-tree writes are few; keep them out of the segment-write burst.
+	for tree, data := range fixture.forest.trees {
+		switch tree.Layer {
 		case hpp.LayerShard, hpp.LayerRegion, hpp.LayerGlobal:
 			scopeType, scopeID, treeID, treeType, parentIndex := fairHMFUpperIdentity(tree)
 			var nodes []cassandrastore.HMFNode
@@ -212,20 +282,79 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 					})
 				}
 			}
-			if err := hmfRepo.UpsertNodes(ctx, nodes); err != nil {
-				return err
+			for start := 0; start < len(nodes); start += fairHMFSeedNodeBatchSize {
+				end := min(start+fairHMFSeedNodeBatchSize, len(nodes))
+				batch := nodes[start:end]
+				if err := fairRetrySeedWrite(ctx, func() error {
+					return hmfRepo.UpsertNodes(ctx, batch)
+				}); err != nil {
+					return err
+				}
 			}
 			root := data.root()
-			if err := hmfRepo.UpsertTreeState(ctx, cassandrastore.HMFTreeState{
+			state := cassandrastore.HMFTreeState{
 				TreeID: treeID, TreeType: treeType, CurrentRoot: root[:],
 				LeafCount: int64(len(data.levels[0])), TreeHeight: int32(len(data.levels) - 1),
 				ParentLeafIndex: parentIndex, UpdatedAt: now,
+			}
+			if err := fairRetrySeedWrite(ctx, func() error {
+				return hmfRepo.UpsertTreeState(ctx, state)
 			}); err != nil {
 				return err
 			}
 		}
 	}
-	return group.Wait()
+	return nil
+}
+
+// seedALL builds and persists the ALL locator tree over every dataset
+// ordinal, mirroring hm.Manager's logical-to-physical propagation to ALL.
+// Requests then resolve through this tree before any HPP proof is built,
+// matching AuditService's real ResolveLocator -> BuildHMFProof chain instead
+// of skipping straight to already-known physical addresses.
+func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
+	for _, table := range []string{"all_pages", "all_tree_state"} {
+		if err := fixture.cassandra.Query("TRUNCATE " + table).ExecContext(ctx); err != nil {
+			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
+		}
+	}
+	tree, err := buildFairLocatorTree(fixture.forest.layout)
+	if err != nil {
+		return fmt.Errorf("build ALL locator tree: %w", err)
+	}
+	writer, err := cassandrastore.NewALLUpdateWriter(
+		fixture.cassandra, fairLocatorTreeID, fairLocatorOrder, fairLocatorPagesPerBucket,
+	)
+	if err != nil {
+		return fmt.Errorf("new ALL update writer: %w", err)
+	}
+	if err := persistFairLocatorTree(ctx, writer, tree); err != nil {
+		return fmt.Errorf("persist ALL locator tree: %w", err)
+	}
+	fixture.allRepo = cassandrastore.NewALLRepo(fixture.cassandra)
+	fixture.locatorRoot = tree.RootHash
+	return nil
+}
+
+// resolveLocator makes one bounded logical ALL query, verifies its proof,
+// then converts its authenticated values to the physical HPP request.
+func (fixture *persistentFairHMFFixture) resolveLocator(ctx context.Context,
+	placement string, count int) ([]hpp.PhysicalAddress, error) {
+	query, err := fairLocatorQuery(placement, count)
+	if err != nil {
+		return nil, err
+	}
+	result, err := fixture.allRepo.ResolveLocatorQuery(ctx, fairLocatorTreeID, fixture.locatorRoot, query)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ALL locator query: %w", err)
+	}
+	if err := locator.VerifyLocatorQueryResult(query, result, fixture.locatorRoot); err != nil {
+		return nil, fmt.Errorf("verify ALL locator proof: %w", err)
+	}
+	if len(result.Entries) != count {
+		return nil, fmt.Errorf("ALL returned %d addresses for %s/q=%d", len(result.Entries), placement, count)
+	}
+	return fairPhysicalAddresses(fixture.forest.layout, result.Entries)
 }
 
 // copyLogsFromDataset streams the shared dataset into hmf.encrypted_logs in
@@ -275,6 +404,17 @@ func (fixture *persistentFairHMFFixture) verify(ctx context.Context,
 		return hpp.VerificationResult{}, err
 	}
 	return hpp.VerificationResult{CalculatedGlobalRoot: root, Proof: proof}, nil
+}
+
+// verifyWorkload times the complete verification instance from one logical
+// ALL query through HPP proof construction and anchored-root verification.
+func (fixture *persistentFairHMFFixture) verifyWorkload(ctx context.Context,
+	placement string, count int) (hpp.VerificationResult, error) {
+	addresses, err := fixture.resolveLocator(ctx, placement, count)
+	if err != nil {
+		return hpp.VerificationResult{}, err
+	}
+	return fixture.verify(ctx, addresses)
 }
 
 // proofWithCurrentLogs is the auditor's evidence acquisition. It reads the

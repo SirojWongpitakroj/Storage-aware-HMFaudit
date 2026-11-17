@@ -2,11 +2,40 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/localization"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
+
+func TestFairSeedWriteRetriesTransientTimeout(t *testing.T) {
+	attempts := 0
+	err := fairRetrySeedWrite(context.Background(), func() error {
+		attempts++
+		if attempts < 3 {
+			return gocql.ErrTimeoutNoResponse
+		}
+		return nil
+	})
+	if err != nil || attempts != 3 {
+		t.Fatalf("retry result = %v after %d attempts, want success after 3", err, attempts)
+	}
+}
+
+func TestFairSeedWriteDoesNotRetryPermanentError(t *testing.T) {
+	attempts := 0
+	err := fairRetrySeedWrite(context.Background(), func() error {
+		attempts++
+		return errors.New("permanent")
+	})
+	if err == nil || attempts != 1 {
+		t.Fatalf("permanent error = %v after %d attempts, want one failure", err, attempts)
+	}
+}
 
 func TestSyntheticBenchmarkScenarioIsValid(t *testing.T) {
 	forest, err := newSyntheticForest()
@@ -44,13 +73,16 @@ func TestFairBenchmarkPlacementMapping(t *testing.T) {
 		}
 	}
 
+	// Scattered stays inside region 0, like clustered: ALL only ever resolves
+	// one contiguous time window within one exact region, so a placement that
+	// jumped across regions would have no single real ALL query behind it.
 	scattered, err := forest.addresses("scattered", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if scattered[0].RegionID != "R0" || scattered[0].LeafID != 0 ||
-		scattered[1].RegionID != "R3" || scattered[1].LeafID != 4095 ||
-		scattered[2].RegionID != "R7" || scattered[2].LeafID != 4095 {
+		scattered[1].RegionID != "R0" || scattered[1].LeafID != 2047 ||
+		scattered[2].RegionID != "R0" || scattered[2].LeafID != 4095 {
 		t.Fatalf("scattered addresses = %+v", scattered)
 	}
 }
@@ -210,6 +242,101 @@ func TestFairLayoutOrdinalInvertsAddress(t *testing.T) {
 	} {
 		if ordinal, ok := layout.ordinal(address); ok {
 			t.Fatalf("ordinal(%+v) = %d, want not ok", address, ordinal)
+		}
+	}
+}
+
+func TestFairALLQueryReturnsOnlyRequestedPhysicalAddresses(t *testing.T) {
+	const segmentLeaves = 8192
+	layout, err := newFairLayout([]int{2 * segmentLeaves, 2 * segmentLeaves, 2 * segmentLeaves}, 1, segmentLeaves)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, err := buildFairLocatorTree(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.LeafCount != int64(layout.total()) {
+		t.Fatalf("ALL contains %d records, want %d", tree.LeafCount, layout.total())
+	}
+	clusterQuery, err := fairLocatorQuery("clustered-2", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scatterQuery, err := fairLocatorQuery("scattered", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clusterQuery.TenantID != scatterQuery.TenantID ||
+		clusterQuery.ServiceID != scatterQuery.ServiceID ||
+		clusterQuery.LogType != scatterQuery.LogType ||
+		clusterQuery.RegionID != scatterQuery.RegionID ||
+		scatterQuery.StartTime.Sub(clusterQuery.StartTime) != fairVerificationMaxCount*time.Second ||
+		clusterQuery.EndTime.Sub(clusterQuery.StartTime) != scatterQuery.EndTime.Sub(scatterQuery.StartTime) {
+		t.Fatalf("ALL query shapes differ: clustered=%+v scattered=%+v", clusterQuery, scatterQuery)
+	}
+	for _, placement := range fairBenchmarkPlacements {
+		for _, count := range []int{1, 16, 256, fairVerificationMaxCount} {
+			query, err := fairLocatorQuery(placement, count)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := tree.Resolve(query)
+			if err != nil {
+				t.Fatalf("ALL %s/q=%d: %v", placement, count, err)
+			}
+			if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err != nil {
+				t.Fatalf("ALL proof %s/q=%d: %v", placement, count, err)
+			}
+			if len(result.Entries) != count {
+				t.Fatalf("ALL %s/q=%d returned %d entries", placement, count, len(result.Entries))
+			}
+			addresses, err := fairPhysicalAddresses(layout, result.Entries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := fairVerificationOrdinals(layout, placement, count)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count >= 16 {
+				wantPrefix := []int{0, 8192, 4096, 12288}
+				if placement == "scattered" {
+					wantPrefix = []int{16384, 32768, 24576, 40960}
+				}
+				for i, ordinal := range wantPrefix {
+					if want[i] != ordinal {
+						t.Fatalf("%s/q=%d ordinal %d = %d, want %d", placement, count, i, want[i], ordinal)
+					}
+				}
+			}
+			for index, address := range addresses {
+				if address != layout.address(want[index]) {
+					t.Fatalf("ALL %s/q=%d address %d = %+v, want ordinal %d",
+						placement, count, index, address, want[index])
+				}
+			}
+			if count > 1 {
+				type segmentKey struct {
+					region  string
+					shard   int64
+					segment int64
+				}
+				segments := make(map[segmentKey]struct{})
+				for _, address := range addresses {
+					if placement == "clustered-2" && address.RegionID != "R0" ||
+						placement == "scattered" && address.RegionID == "R0" {
+						t.Fatalf("%s/q=%d returned address in %s", placement, count, address.RegionID)
+					}
+					segments[segmentKey{address.RegionID, address.ShardID, address.SegmentID}] = struct{}{}
+				}
+				if placement == "clustered-2" && len(segments) != 2 {
+					t.Fatalf("clustered-2/q=%d touched %d segments", count, len(segments))
+				}
+				if placement == "scattered" && len(segments) < 4 {
+					t.Fatalf("scattered/q=%d touched %d segments", count, len(segments))
+				}
+			}
 		}
 	}
 }

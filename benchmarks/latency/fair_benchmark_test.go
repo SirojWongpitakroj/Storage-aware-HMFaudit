@@ -30,17 +30,26 @@ func BenchmarkFairHMFVerificationCore(b *testing.B) {
 	for _, placement := range fairBenchmarkPlacements {
 		for _, batchSize := range fairHMFRequestCounts {
 			b.Run(fmt.Sprintf("%s/q=%d", placement, batchSize), func(b *testing.B) {
-				addresses, err := forest.addresses(placement, batchSize)
+				wantOrdinals, err := fairVerificationOrdinals(forest.layout, placement, batchSize)
 				if err != nil {
 					b.Fatal(err)
 				}
-				reference, err := fixture.verify(context.Background(), addresses)
+				resolved, err := fixture.resolveLocator(context.Background(), placement, batchSize)
+				if err != nil {
+					b.Fatal(err)
+				}
+				for index, address := range resolved {
+					if address != forest.layout.address(wantOrdinals[index]) {
+						b.Fatalf("ALL address %d = %+v, want physical ordinal %d", index, address, wantOrdinals[index])
+					}
+				}
+				reference, err := fixture.verifyWorkload(context.Background(), placement, batchSize)
 				if err != nil {
 					b.Fatal(err)
 				}
 				warmup := fairHMFWarmupCount(b)
 				for range warmup {
-					result, err := fixture.verify(context.Background(), addresses)
+					result, err := fixture.verifyWorkload(context.Background(), placement, batchSize)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -51,11 +60,14 @@ func BenchmarkFairHMFVerificationCore(b *testing.B) {
 				b.ReportMetric(float64(len(reference.Proof.Leaves)), "proof-leaves/op")
 				b.ReportMetric(float64(len(reference.Proof.Nodes)), "proof-nodes/op")
 				b.ReportMetric(1, "postgres-batches/op")
+				b.ReportMetric(1, "all-queries/op")
+				b.ReportMetric(float64(batchSize), "all-entries/op")
+				b.ReportMetric(8, "workload-version/op")
 				b.ReportMetric(1, "cassandra-proof-builds/op")
 				b.ReportMetric(float64(fixture.hppConcurrency), "hpp-concurrency/op")
 				b.ReportMetric(float64(warmup), "warmup-ops")
 				for range b.N {
-					result, err := fixture.verify(context.Background(), addresses)
+					result, err := fixture.verifyWorkload(context.Background(), placement, batchSize)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -140,8 +152,21 @@ func BenchmarkFairHMFTamperCountLocalization(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				if len(localized.Proof.Suspects) != tamperCount {
-					b.Fatalf("localized %d suspects, want %d", len(localized.Proof.Suspects), tamperCount)
+				remaining := make(map[hpp.PhysicalAddress]struct{}, len(tampered))
+				for _, address := range tampered {
+					remaining[address] = struct{}{}
+				}
+				for _, suspect := range localized.Proof.Suspects {
+					if suspect.Address == nil {
+						b.Fatalf("localized non-leaf suspect %+v", suspect)
+					}
+					if _, ok := remaining[*suspect.Address]; !ok {
+						b.Fatalf("localized unexpected or duplicate suspect %+v", *suspect.Address)
+					}
+					delete(remaining, *suspect.Address)
+				}
+				if len(remaining) != 0 {
+					b.Fatalf("localization missed %d of %d tampered logs", len(remaining), tamperCount)
 				}
 				warmup := fairHMFWarmupCount(b)
 				for range warmup {

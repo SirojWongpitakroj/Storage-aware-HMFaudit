@@ -342,14 +342,24 @@ func (forest *syntheticForest) addresses(placement string, count int) ([]hpp.Phy
 	return result, nil
 }
 
-// addresses applies the shared ordinal rules over the whole dataset. For
-// count >= 16, clustered-k spreads the requested ordinals across exactly k
-// complete adjacent segments in the first shard. A singleton always selects
-// ordinal zero. Scattered spans the complete dataset.
+// addresses applies the shared ordinal rules over the dataset. For count >=
+// 16, clustered-k spreads the requested ordinals across exactly k complete
+// adjacent segments in the first shard. A singleton always selects ordinal
+// zero. Scattered spans the complete first region (not the whole dataset):
+// ALL only ever resolves one contiguous time window within one exact region
+// (LocatorQuery.Bounds requires an exact RegionID match), so a request that
+// scattered across every region would have no single real ALL query behind
+// it. Keeping scattered inside region 0, like clustered, means both
+// placements resolve through exactly one ALL query.
 func (layout *fairLayout) addresses(placement string, count int) ([]hpp.PhysicalAddress, error) {
 	total := layout.total()
 	if count <= 0 || count > total {
 		return nil, fmt.Errorf("batch size %d exceeds dataset size %d", count, total)
+	}
+	scatteredRegionSize := layout.sizes[0]
+	if placement == "scattered" && count > scatteredRegionSize {
+		return nil, fmt.Errorf("scattered cannot select %d unique records from region 0's %d records",
+			count, scatteredRegionSize)
 	}
 	clusteredSegments, isClustered := fairClusteredSegmentCount(placement)
 	clusteredWindow := 0
@@ -379,7 +389,7 @@ func (layout *fairLayout) addresses(placement string, count int) ([]hpp.Physical
 			}
 		case "scattered":
 			if count > 1 {
-				ordinal = index * (total - 1) / (count - 1)
+				ordinal = layout.starts[0] + index*(scatteredRegionSize-1)/(count-1)
 			}
 		default:
 			return nil, fmt.Errorf("unknown placement %q", placement)
