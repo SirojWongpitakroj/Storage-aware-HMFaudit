@@ -6,15 +6,15 @@ import (
 	"encoding/binary"
 )
 
-// Compare compares locator keys lexicographically by TenantID, ServiceID,
-// LogType, RegionID, EventTime, and LogID.
+// Compare compares locator keys lexicographically by ServiceID, LogType,
+// RegionID, EventTime, TenantID, and LogID.
+//
+// TenantID follows EventTime on purpose. A query that fixes the service, log
+// type and region and gives a time range is then ONE continuous key range that
+// holds the logs of every tenant, so all tenants are resolved by a single
+// range proof. Narrowing to one tenant is a filter over that verified range
+// (LocatorQuery.FilterTenant).
 func (key LocatorKey) Compare(other LocatorKey) int {
-	if key.TenantID != other.TenantID {
-		if key.TenantID < other.TenantID {
-			return -1
-		}
-		return 1
-	}
 	if key.ServiceID != other.ServiceID {
 		if key.ServiceID < other.ServiceID {
 			return -1
@@ -35,6 +35,12 @@ func (key LocatorKey) Compare(other LocatorKey) int {
 	}
 	if !key.EventTime.Equal(other.EventTime) {
 		if key.EventTime.Before(other.EventTime) {
+			return -1
+		}
+		return 1
+	}
+	if key.TenantID != other.TenantID {
+		if key.TenantID < other.TenantID {
 			return -1
 		}
 		return 1

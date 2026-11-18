@@ -48,12 +48,13 @@ func TestLocatorKeyLess(t *testing.T) {
 		name string
 		key  locator.LocatorKey
 	}{
-		{name: "tenant", key: locator.LocatorKey{TenantID: "tenant-a"}},
-		{name: "service", key: locator.LocatorKey{TenantID: base.TenantID, ServiceID: "service-a"}},
-		{name: "log type", key: locator.LocatorKey{TenantID: base.TenantID, ServiceID: base.ServiceID, LogType: "type-a"}},
-		{name: "region", key: locator.LocatorKey{TenantID: base.TenantID, ServiceID: base.ServiceID, LogType: base.LogType, RegionID: "region-a"}},
-		{name: "event time", key: locator.LocatorKey{TenantID: base.TenantID, ServiceID: base.ServiceID, LogType: base.LogType, RegionID: base.RegionID, EventTime: baseTime.Add(-time.Second)}},
-		{name: "log ID", key: locator.LocatorKey{TenantID: base.TenantID, ServiceID: base.ServiceID, LogType: base.LogType, RegionID: base.RegionID, EventTime: baseTime, LogID: uuid.UUID{1}}},
+		// Key order: service, log type, region, event time, tenant, log ID.
+		{name: "service", key: locator.LocatorKey{ServiceID: "service-a"}},
+		{name: "log type", key: locator.LocatorKey{ServiceID: base.ServiceID, LogType: "type-a"}},
+		{name: "region", key: locator.LocatorKey{ServiceID: base.ServiceID, LogType: base.LogType, RegionID: "region-a"}},
+		{name: "event time", key: locator.LocatorKey{ServiceID: base.ServiceID, LogType: base.LogType, RegionID: base.RegionID, EventTime: baseTime.Add(-time.Second)}},
+		{name: "tenant", key: locator.LocatorKey{ServiceID: base.ServiceID, LogType: base.LogType, RegionID: base.RegionID, EventTime: baseTime, TenantID: "tenant-a"}},
+		{name: "log ID", key: locator.LocatorKey{ServiceID: base.ServiceID, LogType: base.LogType, RegionID: base.RegionID, EventTime: baseTime, TenantID: base.TenantID, LogID: uuid.UUID{1}}},
 	}
 
 	for _, test := range tests {
@@ -264,6 +265,135 @@ func TestLocatorQueryResolveUsesHalfOpenTimeRange(t *testing.T) {
 	}
 	if result.Successor == nil || result.Successor.Value.LeafID != "3" {
 		t.Fatalf("successor = %+v, want leaf ID 3", result.Successor)
+	}
+}
+
+// allTenantsTree holds three tenants with one log per second for six seconds,
+// plus entries of another service and another region that no query below may
+// return. Tenants interleave in time: second s belongs to tenant s%3.
+func allTenantsTree() *locator.LocatorTree {
+	tree := locator.NewLocatorTree(4)
+	tenants := []string{"tenant-a", "tenant-b", "tenant-c"}
+	next := byte(1)
+	insert := func(tenant, service, region string, second int) {
+		key := locator.LocatorKey{
+			TenantID: tenant, ServiceID: service, LogType: "audit", RegionID: region,
+			EventTime: time.Date(2026, time.January, 1, 0, 0, second, 0, time.UTC),
+			LogID:     uuid.UUID{next},
+		}
+		tree.Insert(key, testLocatorValue(int(next)), tree.RootPage)
+		next++
+	}
+	for second := 0; second < 6; second++ {
+		for _, tenant := range tenants { // every tenant logs at every second
+			insert(tenant, "service", "region", second)
+		}
+	}
+	insert("tenant-a", "other-service", "region", 2)
+	insert("tenant-b", "service", "other-region", 2)
+	return tree
+}
+
+// One query, no tenant: every tenant's logs in [start, end) come back together,
+// verified by a single range proof, and nothing from another service or region.
+func TestLocatorQueryResolvesAllTenantsWithOneQuery(t *testing.T) {
+	tree := allTenantsTree()
+	query := locator.LocatorQuery{
+		ServiceID: "service", LogType: "audit", RegionID: "region",
+		StartTime: time.Date(2026, time.January, 1, 0, 0, 1, 0, time.UTC),
+		EndTime:   time.Date(2026, time.January, 1, 0, 0, 3, 0, time.UTC),
+	}
+	result, err := tree.Resolve(query)
+	if err != nil {
+		t.Fatalf("resolve all-tenant query: %v", err)
+	}
+	if len(result.Entries) != 6 { // 3 tenants x seconds 1 and 2
+		t.Fatalf("got %d entries, want 6 (3 tenants x 2 seconds): %+v", len(result.Entries), result.Entries)
+	}
+	seen := map[string]int{}
+	for _, entry := range result.Entries {
+		seen[entry.Key.TenantID]++
+		if entry.Key.ServiceID != "service" || entry.Key.RegionID != "region" {
+			t.Fatalf("entry outside the queried service/region: %+v", entry.Key)
+		}
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b", "tenant-c"} {
+		if seen[tenant] != 2 {
+			t.Fatalf("tenant %s has %d entries, want 2 (all tenants in one result)", tenant, seen[tenant])
+		}
+	}
+	if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err != nil {
+		t.Fatalf("one range proof must verify the all-tenant result: %v", err)
+	}
+	if got := query.FilterTenant(result.Entries); len(got) != 6 {
+		t.Fatalf("no tenant means no filtering: got %d, want 6", len(got))
+	}
+}
+
+// A tenant names a subset of the same verified range; the proof is unchanged.
+func TestLocatorQueryTenantIsAFilterOverTheVerifiedRange(t *testing.T) {
+	tree := allTenantsTree()
+	query := locator.LocatorQuery{
+		TenantID: "tenant-b", ServiceID: "service", LogType: "audit", RegionID: "region",
+		StartTime: time.Date(2026, time.January, 1, 0, 0, 1, 0, time.UTC),
+		EndTime:   time.Date(2026, time.January, 1, 0, 0, 5, 0, time.UTC),
+	}
+	result, err := tree.Resolve(query)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	filtered := query.FilterTenant(result.Entries)
+	if len(filtered) != 4 { // tenant-b at seconds 1..4
+		t.Fatalf("got %d tenant-b entries, want 4", len(filtered))
+	}
+	for _, entry := range filtered {
+		if entry.Key.TenantID != "tenant-b" {
+			t.Fatalf("filter let through tenant %q", entry.Key.TenantID)
+		}
+	}
+	if len(result.Entries) != 12 { // the proof still covers all three tenants
+		t.Fatalf("verified range holds %d entries, want 12 (3 tenants x 4 seconds)", len(result.Entries))
+	}
+}
+
+// Completeness holds across tenants: a server that leaves out any one tenant's
+// log from the range must be rejected.
+func TestLocatorQueryRejectsOmittingAnyTenant(t *testing.T) {
+	tree := allTenantsTree()
+	query := locator.LocatorQuery{
+		ServiceID: "service", LogType: "audit", RegionID: "region",
+		StartTime: time.Date(2026, time.January, 1, 0, 0, 1, 0, time.UTC),
+		EndTime:   time.Date(2026, time.January, 1, 0, 0, 3, 0, time.UTC),
+	}
+	for drop := 0; drop < 6; drop++ {
+		result, err := tree.Resolve(query)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		result.Entries = append(append([]locator.LocatorEntry{}, result.Entries[:drop]...), result.Entries[drop+1:]...)
+		if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err == nil {
+			t.Fatalf("result with entry %d omitted (tenant %s) must not verify", drop, result.Entries[0].Key.TenantID)
+		}
+	}
+}
+
+func TestLocatorQueryStillRequiresServiceTypeAndRegion(t *testing.T) {
+	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	for name, query := range map[string]locator.LocatorQuery{
+		"no service":  {LogType: "audit", RegionID: "region", StartTime: start, EndTime: start.Add(time.Second)},
+		"no log type": {ServiceID: "service", RegionID: "region", StartTime: start, EndTime: start.Add(time.Second)},
+		"no region":   {ServiceID: "service", LogType: "audit", StartTime: start, EndTime: start.Add(time.Second)},
+	} {
+		if _, _, err := query.Bounds(); err == nil {
+			t.Fatalf("%s: Bounds should reject the query", name)
+		}
+	}
+	if _, _, err := (locator.LocatorQuery{ServiceID: "service", LogType: "audit", RegionID: "region",
+		StartTime: start, EndTime: start.Add(time.Second)}).Bounds(); err != nil {
+		t.Fatalf("a query without a tenant must be valid: %v", err)
 	}
 }
 

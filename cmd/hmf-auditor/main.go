@@ -26,6 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -87,7 +88,7 @@ func main() {
 }
 
 func run() (int, error) {
-	tenant := flag.String("tenant", "", "tenant_id (required)")
+	tenant := flag.String("tenant", "", "tenant_id (optional; omit it to query all tenants with a single query)")
 	service := flag.String("service", "", "service_id (required)")
 	logType := flag.String("log-type", "", "log_type (required)")
 	region := flag.String("region", "", "region_id (required)")
@@ -102,10 +103,11 @@ func run() (int, error) {
 	keyFile := flag.String("key-file", "", "AES-256 key file; with it, VALID logs are shown decrypted")
 	limit := flag.Int("limit", 20, "rows to print in table mode (the summary always counts all)")
 	asJSON := flag.Bool("json", false, "print every log as one JSON line")
+	repeats := flag.Int("repeats", 0, "after the normal run (the warm-up), repeat steps 2-3 silently this many times and print the median time; connection set-up is not timed")
 	flag.Parse()
 
-	if *tenant == "" || *service == "" || *logType == "" || *region == "" {
-		return 0, fmt.Errorf("-tenant, -service, -log-type and -region are required")
+	if *service == "" || *logType == "" || *region == "" {
+		return 0, fmt.Errorf("-service, -log-type and -region are required (-tenant is optional)")
 	}
 	query, err := buildQuery(*tenant, *service, *logType, *region, *start, *end, *at)
 	if err != nil {
@@ -170,15 +172,22 @@ func run() (int, error) {
 	}
 	fmt.Printf("checkpoint %d  (R_L %s...  R_G %s...)\n", trusted.Sequence,
 		hex.EncodeToString(trusted.LocatorRoot[:4]), hex.EncodeToString(trusted.GlobalHMFRoot[:4]))
-	fmt.Printf("query: tenant=%s service=%s log_type=%s region=%s time=[%s, %s)\n", query.TenantID, query.ServiceID,
+	tenantLabel := query.TenantID
+	if tenantLabel == "" {
+		tenantLabel = "* (all tenants, one query)"
+	}
+	fmt.Printf("query: tenant=%s service=%s log_type=%s region=%s time=[%s, %s)\n", tenantLabel, query.ServiceID,
 		query.LogType, query.RegionID, query.StartTime.Format(time.RFC3339), query.EndTime.Format(time.RFC3339))
-	fmt.Printf("locator proof verified: %d matching log(s), none omitted\n", len(result.Entries))
-	if len(result.Entries) == 0 {
+	// The proof covers the whole range, so the filter below only narrows an
+	// already-verified result (it is the identity when no tenant is given).
+	entries := query.FilterTenant(result.Entries)
+	fmt.Printf("locator proof verified: %d matching log(s), none omitted\n", len(entries))
+	if len(entries) == 0 {
 		return 0, nil
 	}
 
 	// 3. Evidence: current stored rows, then the HMF proof.
-	candidates, err := collect(ctx, postgresql.NewLogRepository(pool), result.Entries)
+	candidates, err := collect(ctx, postgresql.NewLogRepository(pool), entries)
 	if err != nil {
 		return 0, err
 	}
@@ -199,6 +208,38 @@ func run() (int, error) {
 	}
 	if err := auditor.verify(ctx, provable); err != nil {
 		return 0, err
+	}
+
+	timingLine := ""
+	if *repeats > 0 {
+		runs := make([]float64, 0, *repeats)
+		for range *repeats {
+			begin := time.Now()
+			again, err := cassandrastore.NewALLRepo(session).ResolveLocatorQuery(ctx, trusted.LocatorTreeID, trusted.LocatorRoot, query)
+			if err != nil {
+				return 0, err
+			}
+			if err := locator.VerifyLocatorQueryResult(query, again, trusted.LocatorRoot); err != nil {
+				return 0, err
+			}
+			rows, err := collect(ctx, postgresql.NewLogRepository(pool), query.FilterTenant(again.Entries))
+			if err != nil {
+				return 0, err
+			}
+			var usable []*candidate
+			for _, item := range rows {
+				if item.failure == "" {
+					usable = append(usable, item)
+				}
+			}
+			if err := (&groupVerifier{service: hppService, trustedRoot: trusted.GlobalHMFRoot}).verify(ctx, usable); err != nil {
+				return 0, err
+			}
+			runs = append(runs, float64(time.Since(begin).Microseconds())/1000)
+		}
+		sorted := slices.Clone(runs)
+		slices.Sort(sorted)
+		timingLine = fmt.Sprintf("timing: median_ms=%.3f repeats=%d runs_ms=%v", sorted[len(sorted)/2], *repeats, runs)
 	}
 
 	verdicts := make([]verdict, 0, len(candidates))
@@ -238,6 +279,9 @@ func run() (int, error) {
 	print(verdicts, *asJSON, *limit)
 	fmt.Printf("\n%d log(s): %d VALID, %d REJECTED  (%d HMF proof(s) built)\n",
 		len(verdicts), len(verdicts)-rejected, rejected, auditor.proofs)
+	if timingLine != "" {
+		fmt.Println(timingLine)
+	}
 	if rejected > 0 {
 		fmt.Printf("BATCH: FAIL   (%d of %d log(s) rejected)\n", rejected, len(verdicts))
 		return 1, nil

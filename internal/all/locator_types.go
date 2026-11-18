@@ -24,8 +24,14 @@ type LocatorValue struct {
 	LeafID    string
 }
 
-// LocatorQuery describes one continuous range in the ALL key order. The
-// first four fields are exact matches and the time interval is half-open.
+// LocatorQuery describes one continuous range in the ALL key order (service,
+// log type, region, event time, tenant, log ID). ServiceID, LogType and
+// RegionID are exact matches and the time interval is half-open. The range
+// covers every tenant, so one query and one range proof resolve all tenants.
+//
+// TenantID is optional. Empty means all tenants. When set, it selects one
+// tenant's entries out of the verified range (FilterTenant); it does not change
+// the range or the proof.
 type LocatorQuery struct {
 	TenantID  string
 	ServiceID string
