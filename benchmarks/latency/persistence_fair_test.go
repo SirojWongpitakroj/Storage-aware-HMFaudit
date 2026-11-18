@@ -28,9 +28,25 @@ import (
 
 const (
 	fairHMFSeedNodeBatchSize = 32
-	fairHMFSeedConcurrency   = 4
 	fairHMFSeedWriteAttempts = 5
+
+	// fairHMFDefaultSeedConcurrency is the number of segment trees written to
+	// Cassandra at once while seeding. It is setup only and independent of
+	// FAIR_HMF_HPP_CONCURRENCY (the timed request concurrency). Writes that
+	// time out are retried by fairRetrySeedWrite.
+	fairHMFDefaultSeedConcurrency = 8
 )
+
+// fairHMFSeedConcurrency returns FAIR_HMF_SEED_CONCURRENCY (a positive integer)
+// or the default.
+func fairHMFSeedConcurrency() int {
+	if value := os.Getenv("FAIR_HMF_SEED_CONCURRENCY"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fairHMFDefaultSeedConcurrency
+}
 
 // The fixture writes immutable, idempotent rows before any benchmark timer
 // starts. Retry only Cassandra's transient write failures; a timed-out batch
@@ -118,6 +134,9 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 	if os.Getenv("FAIR_PERSISTENCE") != "1" {
 		b.Fatal("FAIR_PERSISTENCE=1 is required; use systems/run-fair-benchmarks.ps1")
 	}
+	// Setup only: building and seeding the fixture is not timed, so it may use
+	// every core. The timed requests run again under the process's GOMAXPROCS.
+	defer raiseFairSetupProcs()()
 	leaves, regionSizes := loadFairHMFLeaves(b)
 	layout, err := newFairLayout(regionSizes,
 		fairHMFLayoutSetting(b, "FAIR_HMF_SHARDS_PER_REGION", 1),
@@ -216,7 +235,7 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	// Segment trees are independent partitions. Keep each batch small and the
 	// worker count bounded so Cassandra does not time out under 10M-node setup.
 	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(fairHMFSeedConcurrency)
+	group.SetLimit(fairHMFSeedConcurrency())
 	for tree, data := range fixture.forest.trees {
 		if tree.Layer != hpp.LayerSegment {
 			continue
