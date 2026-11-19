@@ -154,10 +154,8 @@ func fairLocatorQuery(placement string, count int) (locator.LocatorQuery, error)
 	if err != nil {
 		return locator.LocatorQuery{}, err
 	}
-	// No TenantID: the query covers all tenants with one range proof. The
-	// fixture's records carry the single tenant fairLocatorTenantID, so the
-	// result is the same q entries either way.
 	return locator.LocatorQuery{
+		TenantID:  fairLocatorTenantID,
 		ServiceID: fairLocatorVerificationServiceID,
 		LogType:   fairLocatorLogType,
 		RegionID:  fairLocatorLogicalRegionID,

@@ -18,9 +18,9 @@ import (
 )
 
 // Native query sets (FAIR_QUERY_DIR). In this mode the ALL locator tree indexes every
-// record under its real service, log type, region, event time and tenant, and the
+// record under its real tenant, service, log type, region and event time, and the
 // verification benchmark runs the HMF-Audit queries of R0_queries.json: one ALL range
-// query (service, log type, region, time range, optional tenant) per audit batch.
+// query (tenant, service, log type, region, time range) per audit batch.
 
 // fairNativeMetadata is the per-record metadata the ALL tree indexes.
 type fairNativeMetadata struct {
@@ -119,7 +119,7 @@ func stringRanks(table []string) []uint16 {
 }
 
 // buildNativeLocatorTree indexes every record under its real metadata. Records are
-// inserted in key order (service, log type, region, event time, tenant, log ID), the
+// inserted in key order (tenant, service, log type, region, event time, log ID), the
 // same right-edge insertion the synthetic tree uses, so the tree's shape does not
 // depend on the dataset's file order.
 func buildNativeLocatorTree(layout *fairLayout, meta *fairNativeMetadata) (*locator.LocatorTree, error) {
@@ -140,6 +140,8 @@ func buildNativeLocatorTree(layout *fairLayout, meta *fairNativeMetadata) (*loca
 	}
 	slices.SortFunc(order, func(a, b int32) int {
 		switch {
+		case tenantRank[meta.tenant[a]] != tenantRank[meta.tenant[b]]:
+			return int(tenantRank[meta.tenant[a]]) - int(tenantRank[meta.tenant[b]])
 		case serviceRank[meta.service[a]] != serviceRank[meta.service[b]]:
 			return int(serviceRank[meta.service[a]]) - int(serviceRank[meta.service[b]])
 		case typeRank[meta.logType[a]] != typeRank[meta.logType[b]]:
@@ -151,8 +153,6 @@ func buildNativeLocatorTree(layout *fairLayout, meta *fairNativeMetadata) (*loca
 				return -1
 			}
 			return 1
-		case tenantRank[meta.tenant[a]] != tenantRank[meta.tenant[b]]:
-			return int(tenantRank[meta.tenant[a]]) - int(tenantRank[meta.tenant[b]])
 		}
 		return int(a) - int(b) // the log ID grows with the ordinal
 	})
@@ -187,7 +187,7 @@ type fairHMFNativeQuery struct {
 	Region   string
 	Service  string
 	LogType  string
-	Tenant   string // empty: all tenants
+	Tenant   string
 	From, To time.Time
 	Ordinals []int
 }
@@ -250,14 +250,14 @@ func fairHMFNativeQueries(dir string) ([]fairHMFNativeQuery, error) {
 		if err != nil {
 			return nil, err
 		}
-		tenant := entry.Tenant
-		if len(tenant) >= 3 && tenant[:3] == "any" {
-			tenant = ""
+		if entry.Tenant == "" || entry.Service == "" || entry.LogType == "" || entry.Region == "" {
+			return nil, fmt.Errorf("HMF-Audit %s q=%d set %d: tenant, service, log type and region are required (the ALL key starts with the tenant; regenerate the query files)",
+				entry.Shape, entry.Q, entry.Set)
 		}
 		key := cell{entry.Shape, entry.Q}
 		cells[key] = append(cells[key], fairHMFNativeQuery{
 			Shape: entry.Shape, Q: entry.Q, Set: entry.Set, Region: entry.Region, Service: entry.Service,
-			LogType: entry.LogType, Tenant: tenant, From: from, To: to, Ordinals: entry.RecordOrdinals,
+			LogType: entry.LogType, Tenant: entry.Tenant, From: from, To: to, Ordinals: entry.RecordOrdinals,
 		})
 	}
 	var result []fairHMFNativeQuery
@@ -319,9 +319,9 @@ func nativePhysicalAddresses(layout *fairLayout, entries []locator.LocatorEntry)
 }
 
 // resolveNative makes the one ALL range query, verifies its proof against the trusted
-// locator root, and keeps the entries of the query's tenant (all of them when it names
-// none). check also compares the result with the records the query file expects. It
-// returns the physical addresses and how many entries the range proof covered.
+// locator root. The tenant leads the ALL key order, so the range holds only that
+// tenant's logs. check also compares the result with the records the query file expects.
+// It returns the physical addresses and how many entries the range proof covered.
 func (fixture *persistentFairHMFFixture) resolveNative(ctx context.Context,
 	query fairHMFNativeQuery, check bool) ([]hpp.PhysicalAddress, int, error) {
 	locatorQuery := query.locatorQuery()
@@ -332,7 +332,7 @@ func (fixture *persistentFairHMFFixture) resolveNative(ctx context.Context,
 	if err := locator.VerifyLocatorQueryResult(locatorQuery, result, fixture.locatorRoot); err != nil {
 		return nil, 0, fmt.Errorf("verify ALL locator proof: %w", err)
 	}
-	entries := locatorQuery.FilterTenant(result.Entries)
+	entries := result.Entries
 	if len(entries) != query.Q {
 		return nil, 0, fmt.Errorf("ALL returned %d records for %s, want %d", len(entries), query.name(), query.Q)
 	}

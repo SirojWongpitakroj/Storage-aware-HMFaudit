@@ -43,16 +43,16 @@ func TestNativeLocatorTreeAnswersTheQueryShapeOfTheFile(t *testing.T) {
 	}
 
 	// Brute force: the records of region R1 with service svc-a, type INFO and an
-	// event time in [from, to] (whole seconds, both ends included), optionally of T10.
+	// event time in [from, to] (whole seconds, both ends included), of one tenant.
 	from := time.Unix(1_700_000_000+180, 0).UTC()
 	to := time.Unix(1_700_000_000+270, 0).UTC()
-	for _, tenant := range []string{"", "T10"} {
+	for _, tenant := range []string{"T10", "T9"} {
 		var want []int
 		for ordinal := 600; ordinal < 1200; ordinal++ {
 			when := time.Unix(meta.eventTime[ordinal], 0).UTC()
 			if meta.services[meta.service[ordinal]] == "svc-a" && meta.logTypes[meta.logType[ordinal]] == "INFO" &&
 				!when.Before(from) && !when.After(to) &&
-				(tenant == "" || meta.tenants[meta.tenant[ordinal]] == tenant) {
+				meta.tenants[meta.tenant[ordinal]] == tenant {
 				want = append(want, ordinal)
 			}
 		}
@@ -65,7 +65,7 @@ func TestNativeLocatorTreeAnswersTheQueryShapeOfTheFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		entries := locatorQuery.FilterTenant(result.Entries)
+		entries := result.Entries // the tenant leads the key order: the range holds only its logs
 		_, got, err := nativePhysicalAddresses(layout, entries)
 		if err != nil {
 			t.Fatal(err)
@@ -79,9 +79,6 @@ func TestNativeLocatorTreeAnswersTheQueryShapeOfTheFile(t *testing.T) {
 				t.Fatalf("tenant %q: record %d is ordinal %d, want %d", tenant, index, got[index], want[index])
 			}
 		}
-		if tenant == "T10" && len(result.Entries) <= len(entries) {
-			t.Fatalf("the range proof should cover more entries (%d) than the tenant's (%d)", len(result.Entries), len(entries))
-		}
 	}
 }
 
@@ -91,8 +88,8 @@ func TestFairHMFNativeQueriesOrderAndFields(t *testing.T) {
 	 {"scheme":"BLAS","shape":"clustered","q":1,"set":1},
 	 {"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":4096,"note":"only 3 distinct queries exist"},
 	 {"scheme":"HMF-Audit","region":"R0","shape":"scattered","q":2,"set":2,"service":"s","log_type":"INFO","tenant":"T7","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:09Z"],"record_ordinals":[5,9]},
-	 {"scheme":"HMF-Audit","region":"R0","shape":"scattered","q":2,"set":1,"service":"s","log_type":"INFO","tenant":"any (no tenant filter)","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:09Z"],"record_ordinals":[4,8]},
-	 {"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":1,"set":1,"service":"s","log_type":"WARN","tenant":"any (no tenant filter)","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:05Z"],"record_ordinals":[3]}
+	 {"scheme":"HMF-Audit","region":"R0","shape":"scattered","q":2,"set":1,"service":"s","log_type":"INFO","tenant":"T3","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:09Z"],"record_ordinals":[4,8]},
+	 {"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":1,"set":1,"service":"s","log_type":"WARN","tenant":"T1","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:05Z"],"record_ordinals":[3]}
 	]}`
 	if err := os.WriteFile(filepath.Join(dir, "R0_queries.json"), []byte(file), 0o600); err != nil {
 		t.Fatal(err)
@@ -109,7 +106,7 @@ func TestFairHMFNativeQueriesOrderAndFields(t *testing.T) {
 	if len(names) != 3 || names[0] != want[0] || names[1] != want[1] || names[2] != want[2] {
 		t.Fatalf("queries = %v, want %v", names, want)
 	}
-	if queries[0].Tenant != "" || queries[1].Tenant != "" || queries[2].Tenant != "T7" {
+	if queries[0].Tenant != "T1" || queries[1].Tenant != "T3" || queries[2].Tenant != "T7" {
 		t.Fatalf("tenants = %q %q %q", queries[0].Tenant, queries[1].Tenant, queries[2].Tenant)
 	}
 	// A single-second window must still be a valid (non-empty) half-open range.
@@ -117,4 +114,18 @@ func TestFairHMFNativeQueriesOrderAndFields(t *testing.T) {
 		t.Fatalf("one-second query has an empty range: %v .. %v", bounds.StartTime, bounds.EndTime)
 	}
 	var _ locator.LocatorQuery = queries[0].locatorQuery()
+}
+
+// A query without a tenant cannot be a range under the tenant-first key order.
+func TestFairHMFNativeQueriesRejectMissingTenant(t *testing.T) {
+	dir := t.TempDir()
+	file := `{"queries":[
+	 {"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":1,"set":1,"service":"s","log_type":"WARN","tenant":"","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:05Z"],"record_ordinals":[3]}
+	]}`
+	if err := os.WriteFile(filepath.Join(dir, "R0_queries.json"), []byte(file), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fairHMFNativeQueries(dir); err == nil {
+		t.Fatal("a query without a tenant was accepted")
+	}
 }
