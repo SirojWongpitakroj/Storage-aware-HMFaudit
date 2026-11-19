@@ -27,6 +27,11 @@ type fairHMFRecord struct {
 func BenchmarkFairHMFVerificationCore(b *testing.B) {
 	fixture := sharedFairHMFFixture(b)
 	forest := fixture.forest
+	// Native query sets: the five clustered and five scattered HMF-Audit queries per q.
+	if dir := os.Getenv("FAIR_QUERY_DIR"); dir != "" {
+		runFairHMFNativeVerification(b, fixture, dir)
+		return
+	}
 	for _, placement := range fairBenchmarkPlacements {
 		for _, batchSize := range fairHMFRequestCounts {
 			b.Run(fmt.Sprintf("%s/q=%d", placement, batchSize), func(b *testing.B) {

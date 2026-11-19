@@ -78,6 +78,15 @@ func fairRetrySeedWrite(ctx context.Context, write func() error) error {
 	panic("unreachable")
 }
 
+// fairPhase times one setup phase. The line goes to stderr, so it lands in the raw
+// result file next to the benchmark output (the parser ignores it).
+func fairPhase(name string) func() {
+	started := time.Now()
+	return func() {
+		fmt.Fprintf(os.Stderr, "fixture-timing: %s: %s\n", name, time.Since(started).Round(time.Millisecond))
+	}
+}
+
 type persistentFairHMFFixture struct {
 	forest         *syntheticForest
 	postgres       *pgxpool.Pool
@@ -137,14 +146,18 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 	// Setup only: building and seeding the fixture is not timed, so it may use
 	// every core. The timed requests run again under the process's GOMAXPROCS.
 	defer raiseFairSetupProcs()()
+	stopPhase := fairPhase("read the dataset and hash every record")
 	leaves, regionSizes := loadFairHMFLeaves(b)
+	stopPhase()
 	layout, err := newFairLayout(regionSizes,
 		fairHMFLayoutSetting(b, "FAIR_HMF_SHARDS_PER_REGION", 1),
 		fairHMFLayoutSetting(b, "FAIR_HMF_SEGMENT_LEAVES", 1<<13))
 	if err != nil {
 		b.Fatal(err)
 	}
+	stopPhase = fairPhase("build the in-memory forest")
 	forest, err := newFairForest(layout, leaves)
+	stopPhase()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -215,6 +228,7 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 }
 
 func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
+	stopPhase := fairPhase("PostgreSQL logs: truncate + COPY")
 	if _, err := fixture.postgres.Exec(ctx, "TRUNCATE TABLE hmf.encrypted_logs RESTART IDENTITY"); err != nil {
 		return fmt.Errorf("truncate PostgreSQL logs: %w", err)
 	}
@@ -223,7 +237,9 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	if err := fixture.copyLogsFromDataset(ctx); err != nil {
 		return err
 	}
+	stopPhase()
 
+	stopPhase = fairPhase("Cassandra: truncate + segment trees")
 	for _, table := range []string{"merkle_segment_nodes", "hmf_segments_by_shard", "upper_merkle_nodes", "tree_state_by_id"} {
 		if err := fixture.cassandra.Query("TRUNCATE " + table).ExecContext(ctx); err != nil {
 			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
@@ -287,6 +303,8 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	if err := group.Wait(); err != nil {
 		return err
 	}
+	stopPhase()
+	stopPhase = fairPhase("Cassandra: upper trees")
 	// Upper-tree writes are few; keep them out of the segment-write burst.
 	for tree, data := range fixture.forest.trees {
 		switch tree.Layer {
@@ -323,6 +341,7 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 			}
 		}
 	}
+	stopPhase()
 	return nil
 }
 
@@ -337,7 +356,20 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
 		}
 	}
-	tree, err := buildFairLocatorTree(fixture.forest.layout)
+	stopPhase := fairPhase("ALL: build the locator tree in memory")
+	var tree *locator.LocatorTree
+	var err error
+	if os.Getenv("FAIR_QUERY_DIR") != "" {
+		// Native query sets: index every record under its real metadata.
+		var meta *fairNativeMetadata
+		meta, err = loadFairNativeMetadata(os.Getenv("FAIR_DATASET_PATH"), fixture.forest.layout.total())
+		if err == nil {
+			tree, err = buildNativeLocatorTree(fixture.forest.layout, meta)
+		}
+	} else {
+		tree, err = buildFairLocatorTree(fixture.forest.layout)
+	}
+	stopPhase()
 	if err != nil {
 		return fmt.Errorf("build ALL locator tree: %w", err)
 	}
@@ -347,6 +379,8 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("new ALL update writer: %w", err)
 	}
+	stopPhase = fairPhase("ALL: persist the locator tree to Cassandra")
+	defer func() { stopPhase() }()
 	if err := persistFairLocatorTree(ctx, writer, tree); err != nil {
 		return fmt.Errorf("persist ALL locator tree: %w", err)
 	}
