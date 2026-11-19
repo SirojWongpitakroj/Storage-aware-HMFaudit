@@ -91,6 +91,11 @@ type LocatorTree struct {
 	LeafCount int64
 
 	Order int //m: max children per internal page
+
+	// deferHashes is set between BeginBulkLoad and FinishBulkLoad: inserts
+	// and splits leave page hashes unset and FinishBulkLoad computes every
+	// page hash once, bottom-up.
+	deferHashes bool
 }
 
 // LocatorUpdate contains the final ALL state changed by one insertion.

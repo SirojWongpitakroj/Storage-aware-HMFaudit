@@ -89,6 +89,9 @@ type persistentFairHMFFixture struct {
 
 	allRepo     *cassandrastore.ALLRepo
 	locatorRoot [32]byte
+	// attributes are every record's ALL key attributes; the ALL tree is built
+	// from them and native queries are recounted against them.
+	attributes *fairHMFAttributes
 }
 
 // TestMain closes the shared fixture's connections once every benchmark in
@@ -193,6 +196,10 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 	// constructing the 10M-entry locator tree to reduce peak memory pressure.
 	fixture.forest.trees = nil
 	fixture.forest.metadata = hpp.HierarchyMetadata{}
+	fixture.attributes, err = loadFairHMFAttributes(os.Getenv("FAIR_DATASET_PATH"), fixture.forest.layout)
+	if err != nil {
+		return nil, fmt.Errorf("load ALL key attributes: %w", err)
+	}
 	allSeedCtx, cancelALLSeed := context.WithTimeout(context.Background(), 3*time.Hour)
 	defer cancelALLSeed()
 	if err := fixture.seedALL(allSeedCtx); err != nil {
@@ -337,7 +344,7 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
 		}
 	}
-	tree, err := buildFairLocatorTree(fixture.forest.layout)
+	tree, err := buildFairLocatorTree(fixture.forest.layout, fixture.attributes)
 	if err != nil {
 		return fmt.Errorf("build ALL locator tree: %w", err)
 	}
@@ -355,25 +362,25 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 	return nil
 }
 
-// resolveLocator makes one bounded logical ALL query, verifies its proof,
-// then converts its authenticated values to the physical HPP request.
+// resolveLocator makes one native ALL query, verifies its proof over the
+// whole range (all tenants), filters a named tenant (FilterTenant), then
+// converts the authenticated values to the physical HPP request. It returns
+// the addresses and the number of entries in the authenticated range.
 func (fixture *persistentFairHMFFixture) resolveLocator(ctx context.Context,
-	placement string, count int) ([]hpp.PhysicalAddress, error) {
-	query, err := fairLocatorQuery(placement, count)
+	native fairHMFNativeQuery) ([]hpp.PhysicalAddress, int, error) {
+	result, err := fixture.allRepo.ResolveLocatorQuery(ctx, fairLocatorTreeID, fixture.locatorRoot, native.Query)
 	if err != nil {
-		return nil, err
+		return nil, 0, fmt.Errorf("resolve ALL locator query: %w", err)
 	}
-	result, err := fixture.allRepo.ResolveLocatorQuery(ctx, fairLocatorTreeID, fixture.locatorRoot, query)
-	if err != nil {
-		return nil, fmt.Errorf("resolve ALL locator query: %w", err)
+	if err := locator.VerifyLocatorQueryResult(native.Query, result, fixture.locatorRoot); err != nil {
+		return nil, 0, fmt.Errorf("verify ALL locator proof: %w", err)
 	}
-	if err := locator.VerifyLocatorQueryResult(query, result, fixture.locatorRoot); err != nil {
-		return nil, fmt.Errorf("verify ALL locator proof: %w", err)
+	entries := native.Query.FilterTenant(result.Entries)
+	if len(entries) != native.Q {
+		return nil, 0, fmt.Errorf("ALL returned %d logs for %s, want %d", len(entries), native.name(), native.Q)
 	}
-	if len(result.Entries) != count {
-		return nil, fmt.Errorf("ALL returned %d addresses for %s/q=%d", len(result.Entries), placement, count)
-	}
-	return fairPhysicalAddresses(fixture.forest.layout, result.Entries)
+	addresses, err := fairPhysicalAddresses(fixture.forest.layout, entries)
+	return addresses, len(result.Entries), err
 }
 
 // copyLogsFromDataset streams the shared dataset into hmf.encrypted_logs in
@@ -428,8 +435,8 @@ func (fixture *persistentFairHMFFixture) verify(ctx context.Context,
 // verifyWorkload times the complete verification instance from one logical
 // ALL query through HPP proof construction and anchored-root verification.
 func (fixture *persistentFairHMFFixture) verifyWorkload(ctx context.Context,
-	placement string, count int) (hpp.VerificationResult, error) {
-	addresses, err := fixture.resolveLocator(ctx, placement, count)
+	native fairHMFNativeQuery) (hpp.VerificationResult, error) {
+	addresses, _, err := fixture.resolveLocator(ctx, native)
 	if err != nil {
 		return hpp.VerificationResult{}, err
 	}

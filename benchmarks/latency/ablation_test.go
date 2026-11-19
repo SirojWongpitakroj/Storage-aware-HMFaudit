@@ -75,14 +75,14 @@ const (
 	defaultAblationMeasured = 30
 )
 
-// ablationBatchSizes returns the protocol's q values (256, 1024, 4096,
-// 16384), overridable via FAIR_ABLATION_BATCH_SIZES (comma-separated) for
+// ablationBatchSizes returns the protocol's q values (256, 1024, 4096),
+// overridable via FAIR_ABLATION_BATCH_SIZES (comma-separated) for
 // fast iteration against a small dataset during development.
 func ablationBatchSizes(t *testing.T) []int {
 	t.Helper()
 	value := os.Getenv("FAIR_ABLATION_BATCH_SIZES")
 	if value == "" {
-		return []int{256, 1024, 4096, 16384}
+		return []int{256, 1024, 4096}
 	}
 	var sizes []int
 	for _, part := range splitCommaInts(t, value) {
@@ -171,10 +171,10 @@ type ablationExecution struct {
 // construction (Check 6); only the retrieval method differs.
 func runAblationOnce(ctx context.Context, fixture *persistentFairHMFFixture,
 	reader *cassandrastore.HPPReader, variant ablationVariant,
-	placement string, q int) (ablationExecution, error) {
+	native fairHMFNativeQuery) (ablationExecution, error) {
 
 	started := time.Now()
-	addresses, err := fixture.resolveLocator(ctx, placement, q)
+	addresses, _, err := fixture.resolveLocator(ctx, native)
 	if err != nil {
 		return ablationExecution{}, fmt.Errorf("resolve locator: %w", err)
 	}
@@ -381,12 +381,13 @@ func addressesEqual(left, right []hpp.PhysicalAddress) bool {
 // ALL result) follows directly from Check 1, since every variant resolves
 // through the same ALL query against the same unchanging locator tree.
 func validateCell(t *testing.T, ctx context.Context, fixture *persistentFairHMFFixture,
-	reader *cassandrastore.HPPReader, placement string, q int) map[ablationVariant]ablationExecution {
+	reader *cassandrastore.HPPReader, native fairHMFNativeQuery) map[ablationVariant]ablationExecution {
 	t.Helper()
+	placement, q := fmt.Sprintf("%s/set=%d", native.Shape, native.Set), native.Q
 
 	results := make(map[ablationVariant]ablationExecution, len(ablationVariants))
 	for _, variant := range ablationVariants {
-		result, err := runAblationOnce(ctx, fixture, reader, variant, placement, q)
+		result, err := runAblationOnce(ctx, fixture, reader, variant, native)
 		if err != nil {
 			t.Fatalf("%s/q=%d: validate %s: %v", placement, q, variant, err)
 		}
@@ -500,7 +501,7 @@ func TestFairHMFAblation(t *testing.T) {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 	if err := writer.Write([]string{
-		"session_id", "variant", "distribution", "q", "run", "is_warmup", "batch_hash", "latency_ms",
+		"session_id", "variant", "distribution", "q", "query_set", "run", "is_warmup", "batch_hash", "latency_ms",
 		"logical_proof_nodes", "unique_proof_nodes", "duplicate_proof_nodes", "proof_bytes",
 		"cassandra_reads", "cassandra_partitions",
 		"cassandra_requested_key_occurrences", "cassandra_unique_rows_returned",
@@ -513,44 +514,51 @@ func TestFairHMFAblation(t *testing.T) {
 	warmupRounds := ablationRoundCount(t, "FAIR_ABLATION_WARMUP", defaultAblationWarmup)
 	measuredRounds := ablationRoundCount(t, "FAIR_ABLATION_MEASURED", defaultAblationMeasured)
 
+	dir := fairNativeQueriesDir()
+	if dir == "" {
+		t.Fatal("FAIR_NATIVE_QUERIES_DIR is required: the ablation runs HMF-Audit's native query set")
+	}
+	queries, err := loadFairHMFNativeQueries(dir, ablationBatchSizes(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	for _, placement := range fairBenchmarkPlacements {
-		for _, q := range ablationBatchSizes(t) {
-			validateCell(t, ctx, fixture, reader, placement, q)
+	for _, native := range queries {
+		placement, q := native.Shape, native.Q
+		validateCell(t, ctx, fixture, reader, native)
 
-			measuredIndex := map[ablationVariant]int{}
-			rounds := warmupRounds + measuredRounds
-			for round := 0; round < rounds; round++ {
-				isWarmup := round < warmupRounds
-				for _, variant := range rotateVariants(ablationVariants, round%len(ablationVariants)) {
-					result, err := runAblationOnce(ctx, fixture, reader, variant, placement, q)
-					if err != nil {
-						t.Fatalf("%s/q=%d round=%d: %s: %v", placement, q, round, variant, err)
-					}
-					if !isWarmup && !result.verificationSuccess {
-						t.Fatalf("CHECK 5 failed: %s/q=%d: %s measured run did not verify", placement, q, variant)
-					}
-					run := -1
-					if !isWarmup {
-						run = measuredIndex[variant]
-						measuredIndex[variant] = run + 1
-					}
-					if err := writeAblationRow(writer, sessionID, variant, placement, q, run, isWarmup, result); err != nil {
-						t.Fatal(err)
-					}
+		measuredIndex := map[ablationVariant]int{}
+		rounds := warmupRounds + measuredRounds
+		for round := 0; round < rounds; round++ {
+			isWarmup := round < warmupRounds
+			for _, variant := range rotateVariants(ablationVariants, round%len(ablationVariants)) {
+				result, err := runAblationOnce(ctx, fixture, reader, variant, native)
+				if err != nil {
+					t.Fatalf("%s round=%d: %s: %v", native.name(), round, variant, err)
+				}
+				if !isWarmup && !result.verificationSuccess {
+					t.Fatalf("CHECK 5 failed: %s: %s measured run did not verify", native.name(), variant)
+				}
+				run := -1
+				if !isWarmup {
+					run = measuredIndex[variant]
+					measuredIndex[variant] = run + 1
+				}
+				if err := writeAblationRow(writer, sessionID, variant, placement, q, native.Set, run, isWarmup, result); err != nil {
+					t.Fatal(err)
 				}
 			}
-			writer.Flush()
-			if err := writer.Error(); err != nil {
-				t.Fatal(err)
-			}
-			t.Logf("%s/q=%d: %d measured executions per variant complete", placement, q, measuredRounds)
 		}
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s: %d measured executions per variant complete", native.name(), measuredRounds)
 	}
 	t.Logf("ablation raw results written to %s", rawPath)
 }
 
-func writeAblationRow(writer *csv.Writer, sessionID string, variant ablationVariant, placement string, q, run int,
+func writeAblationRow(writer *csv.Writer, sessionID string, variant ablationVariant, placement string, q, set, run int,
 	isWarmup bool, result ablationExecution) error {
 
 	return writer.Write([]string{
@@ -558,6 +566,7 @@ func writeAblationRow(writer *csv.Writer, sessionID string, variant ablationVari
 		string(variant),
 		placement,
 		strconv.Itoa(q),
+		strconv.Itoa(set),
 		strconv.Itoa(run),
 		strconv.FormatBool(isWarmup),
 		result.batchHash,

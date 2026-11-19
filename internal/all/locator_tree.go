@@ -93,7 +93,7 @@ func (tree *LocatorTree) insertParent(currPage, rightPage *Page,
 		rightPage.Parent = parent
 		rightPage.ParentPageID = pageIDPointer(parent)
 
-		parent.Hash = parent.internalHash()
+		tree.rehashPage(parent)
 		tree.Height++
 		updates.add(currPage)
 		updates.add(rightPage)
@@ -140,12 +140,12 @@ func (tree *LocatorTree) internalSplit(currPage *Page, updates pageUpdates) {
 		child.ParentPageID = pageIDPointer(rightPage)
 		updates.add(child)
 	}
-	rightPage.Hash = rightPage.internalHash()
+	tree.rehashPage(rightPage)
 
 	// left side
 	currPage.Keys = currPage.Keys[:mid:mid]
 	currPage.Children = currPage.Children[: mid+1 : mid+1]
-	currPage.Hash = currPage.internalHash()
+	tree.rehashPage(currPage)
 	updates.add(currPage)
 	updates.add(rightPage)
 
@@ -168,8 +168,8 @@ func (tree *LocatorTree) leafSplit(currPage *Page, updates pageUpdates) {
 		Next:         currPage.Next,
 	}
 	tree.NextPageID++
-	currPage.Hash = currPage.leafHash()
-	rightPage.Hash = rightPage.leafHash()
+	tree.rehashPage(currPage)
+	tree.rehashPage(rightPage)
 
 	// left side
 	currPage.Keys = currPage.Keys[:mid:mid]
@@ -183,11 +183,7 @@ func (tree *LocatorTree) leafSplit(currPage *Page, updates pageUpdates) {
 
 func (tree *LocatorTree) updatePathHashes(currPage *Page, updates pageUpdates) {
 	for currPage != nil {
-		if currPage.IsLeaf {
-			currPage.Hash = currPage.leafHash()
-		} else {
-			currPage.Hash = currPage.internalHash()
-		}
+		tree.rehashPage(currPage)
 
 		updates.add(currPage)
 
