@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -247,78 +246,97 @@ func TestFairLayoutOrdinalInvertsAddress(t *testing.T) {
 	}
 }
 
-func TestFairALLNativeQueryReturnsOnlyMatchingPhysicalAddresses(t *testing.T) {
-	const segmentLeaves = 8
-	layout, err := newFairLayout([]int{2 * segmentLeaves, 2 * segmentLeaves}, 1, segmentLeaves)
+func TestFairALLQueryReturnsOnlyRequestedPhysicalAddresses(t *testing.T) {
+	const segmentLeaves = 8192
+	layout, err := newFairLayout([]int{2 * segmentLeaves, 2 * segmentLeaves, 2 * segmentLeaves}, 1, segmentLeaves)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Two services, two tenants; one event second per ordinal pair, so two
-	// records share every event time.
-	attributes := &fairHMFAttributes{
-		services: []string{"svc-a", "svc-b"}, logTypes: []string{"INFO"}, tenants: []string{"T1", "T2"},
-	}
-	for ordinal := 0; ordinal < layout.total(); ordinal++ {
-		attributes.service = append(attributes.service, uint16(ordinal%2))
-		attributes.logType = append(attributes.logType, 0)
-		attributes.tenant = append(attributes.tenant, uint16((ordinal/2)%2))
-		attributes.eventTime = append(attributes.eventTime, 1_000+int64(ordinal/2))
-	}
-	tree, err := buildFairLocatorTree(layout, attributes)
+	tree, err := buildFairLocatorTree(layout)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if tree.LeafCount != int64(layout.total()) {
 		t.Fatalf("ALL contains %d records, want %d", tree.LeafCount, layout.total())
 	}
-	for _, test := range []struct {
-		tenant     string
-		start, end int64 // [start, end)
-	}{
-		{"", 1_000, 1_001}, {"", 1_000, 1_004}, {"T1", 1_000, 1_008}, {"T2", 1_003, 1_004},
-	} {
-		query := locator.LocatorQuery{TenantID: test.tenant, ServiceID: "svc-a", LogType: "INFO", RegionID: "R0",
-			StartTime: time.Unix(test.start, 0).UTC(), EndTime: time.Unix(test.end, 0).UTC()}
-		result, err := tree.Resolve(query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err != nil {
-			t.Fatalf("ALL proof %+v: %v", test, err)
-		}
-		wantRange, wantMatched := attributes.expected(layout, query)
-		if len(result.Entries) != wantRange {
-			t.Fatalf("%+v: range has %d entries, want %d", test, len(result.Entries), wantRange)
-		}
-		entries := query.FilterTenant(result.Entries)
-		if len(entries) != len(wantMatched) || len(entries) == 0 {
-			t.Fatalf("%+v: %d entries after the tenant filter, want %d", test, len(entries), len(wantMatched))
-		}
-		addresses, err := fairPhysicalAddresses(layout, entries)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, address := range addresses {
-			ordinal, ok := layout.ordinal(address)
-			if !ok || !wantMatched[ordinal] {
-				t.Fatalf("%+v returned %+v, which the query does not select", test, address)
-			}
-		}
-	}
-}
-
-func TestFairHMFNativeQueriesLoadAndAreHalfOpen(t *testing.T) {
-	queries, err := loadFairHMFNativeQueries(filepath.Join("..", "..", "..", "experiments", "native-queries"),
-		fairHMFRequestCounts)
+	clusterQuery, err := fairLocatorQuery("clustered-2", 16)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(queries) != len(fairNativeShapes)*len(fairHMFRequestCounts)*fairNativeSets {
-		t.Fatalf("got %d queries", len(queries))
+	scatterQuery, err := fairLocatorQuery("scattered", 16)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, native := range queries {
-		if !native.Query.StartTime.Before(native.Query.EndTime) || native.Query.RegionID != "R0" {
-			t.Fatalf("%s: %+v", native.name(), native.Query)
+	if clusterQuery.TenantID != scatterQuery.TenantID ||
+		clusterQuery.ServiceID != scatterQuery.ServiceID ||
+		clusterQuery.LogType != scatterQuery.LogType ||
+		clusterQuery.RegionID != scatterQuery.RegionID ||
+		scatterQuery.StartTime.Sub(clusterQuery.StartTime) != fairVerificationMaxCount*time.Second ||
+		clusterQuery.EndTime.Sub(clusterQuery.StartTime) != scatterQuery.EndTime.Sub(scatterQuery.StartTime) {
+		t.Fatalf("ALL query shapes differ: clustered=%+v scattered=%+v", clusterQuery, scatterQuery)
+	}
+	for _, placement := range fairBenchmarkPlacements {
+		for _, count := range []int{1, 16, 256, fairVerificationMaxCount} {
+			query, err := fairLocatorQuery(placement, count)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := tree.Resolve(query)
+			if err != nil {
+				t.Fatalf("ALL %s/q=%d: %v", placement, count, err)
+			}
+			if err := locator.VerifyLocatorQueryResult(query, result, tree.RootHash); err != nil {
+				t.Fatalf("ALL proof %s/q=%d: %v", placement, count, err)
+			}
+			if len(result.Entries) != count {
+				t.Fatalf("ALL %s/q=%d returned %d entries", placement, count, len(result.Entries))
+			}
+			addresses, err := fairPhysicalAddresses(layout, result.Entries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := fairVerificationOrdinals(layout, placement, count)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count >= 16 {
+				wantPrefix := []int{0, 8192, 4096, 12288}
+				if placement == "scattered" {
+					wantPrefix = []int{16384, 32768, 24576, 40960}
+				}
+				for i, ordinal := range wantPrefix {
+					if want[i] != ordinal {
+						t.Fatalf("%s/q=%d ordinal %d = %d, want %d", placement, count, i, want[i], ordinal)
+					}
+				}
+			}
+			for index, address := range addresses {
+				if address != layout.address(want[index]) {
+					t.Fatalf("ALL %s/q=%d address %d = %+v, want ordinal %d",
+						placement, count, index, address, want[index])
+				}
+			}
+			if count > 1 {
+				type segmentKey struct {
+					region  string
+					shard   int64
+					segment int64
+				}
+				segments := make(map[segmentKey]struct{})
+				for _, address := range addresses {
+					if placement == "clustered-2" && address.RegionID != "R0" ||
+						placement == "scattered" && address.RegionID == "R0" {
+						t.Fatalf("%s/q=%d returned address in %s", placement, count, address.RegionID)
+					}
+					segments[segmentKey{address.RegionID, address.ShardID, address.SegmentID}] = struct{}{}
+				}
+				if placement == "clustered-2" && len(segments) != 2 {
+					t.Fatalf("clustered-2/q=%d touched %d segments", count, len(segments))
+				}
+				if placement == "scattered" && len(segments) < 4 {
+					t.Fatalf("scattered/q=%d touched %d segments", count, len(segments))
+				}
+			}
 		}
 	}
 }

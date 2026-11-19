@@ -78,6 +78,15 @@ func fairRetrySeedWrite(ctx context.Context, write func() error) error {
 	panic("unreachable")
 }
 
+// fairPhase times one setup phase. The line goes to stderr, so it lands in the raw
+// result file next to the benchmark output (the parser ignores it).
+func fairPhase(name string) func() {
+	started := time.Now()
+	return func() {
+		fmt.Fprintf(os.Stderr, "fixture-timing: %s: %s\n", name, time.Since(started).Round(time.Millisecond))
+	}
+}
+
 type persistentFairHMFFixture struct {
 	forest         *syntheticForest
 	postgres       *pgxpool.Pool
@@ -89,9 +98,6 @@ type persistentFairHMFFixture struct {
 
 	allRepo     *cassandrastore.ALLRepo
 	locatorRoot [32]byte
-	// attributes are every record's ALL key attributes; the ALL tree is built
-	// from them and native queries are recounted against them.
-	attributes *fairHMFAttributes
 }
 
 // TestMain closes the shared fixture's connections once every benchmark in
@@ -140,14 +146,18 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 	// Setup only: building and seeding the fixture is not timed, so it may use
 	// every core. The timed requests run again under the process's GOMAXPROCS.
 	defer raiseFairSetupProcs()()
+	stopPhase := fairPhase("read the dataset and hash every record")
 	leaves, regionSizes := loadFairHMFLeaves(b)
+	stopPhase()
 	layout, err := newFairLayout(regionSizes,
 		fairHMFLayoutSetting(b, "FAIR_HMF_SHARDS_PER_REGION", 1),
 		fairHMFLayoutSetting(b, "FAIR_HMF_SEGMENT_LEAVES", 1<<13))
 	if err != nil {
 		b.Fatal(err)
 	}
+	stopPhase = fairPhase("build the in-memory forest")
 	forest, err := newFairForest(layout, leaves)
+	stopPhase()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -196,10 +206,6 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 	// constructing the 10M-entry locator tree to reduce peak memory pressure.
 	fixture.forest.trees = nil
 	fixture.forest.metadata = hpp.HierarchyMetadata{}
-	fixture.attributes, err = loadFairHMFAttributes(os.Getenv("FAIR_DATASET_PATH"), fixture.forest.layout)
-	if err != nil {
-		return nil, fmt.Errorf("load ALL key attributes: %w", err)
-	}
 	allSeedCtx, cancelALLSeed := context.WithTimeout(context.Background(), 3*time.Hour)
 	defer cancelALLSeed()
 	if err := fixture.seedALL(allSeedCtx); err != nil {
@@ -222,6 +228,7 @@ func newPersistentFairHMFFixture(b testing.TB) (*persistentFairHMFFixture, error
 }
 
 func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
+	stopPhase := fairPhase("PostgreSQL logs: truncate + COPY")
 	if _, err := fixture.postgres.Exec(ctx, "TRUNCATE TABLE hmf.encrypted_logs RESTART IDENTITY"); err != nil {
 		return fmt.Errorf("truncate PostgreSQL logs: %w", err)
 	}
@@ -230,7 +237,9 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	if err := fixture.copyLogsFromDataset(ctx); err != nil {
 		return err
 	}
+	stopPhase()
 
+	stopPhase = fairPhase("Cassandra: truncate + segment trees")
 	for _, table := range []string{"merkle_segment_nodes", "hmf_segments_by_shard", "upper_merkle_nodes", "tree_state_by_id"} {
 		if err := fixture.cassandra.Query("TRUNCATE " + table).ExecContext(ctx); err != nil {
 			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
@@ -294,6 +303,8 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 	if err := group.Wait(); err != nil {
 		return err
 	}
+	stopPhase()
+	stopPhase = fairPhase("Cassandra: upper trees")
 	// Upper-tree writes are few; keep them out of the segment-write burst.
 	for tree, data := range fixture.forest.trees {
 		switch tree.Layer {
@@ -330,6 +341,7 @@ func (fixture *persistentFairHMFFixture) seed(ctx context.Context) error {
 			}
 		}
 	}
+	stopPhase()
 	return nil
 }
 
@@ -344,7 +356,20 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 			return fmt.Errorf("truncate Cassandra table %s: %w", table, err)
 		}
 	}
-	tree, err := buildFairLocatorTree(fixture.forest.layout, fixture.attributes)
+	stopPhase := fairPhase("ALL: build the locator tree in memory")
+	var tree *locator.LocatorTree
+	var err error
+	if os.Getenv("FAIR_QUERY_DIR") != "" {
+		// Native query sets: index every record under its real metadata.
+		var meta *fairNativeMetadata
+		meta, err = loadFairNativeMetadata(os.Getenv("FAIR_DATASET_PATH"), fixture.forest.layout.total())
+		if err == nil {
+			tree, err = buildNativeLocatorTree(fixture.forest.layout, meta)
+		}
+	} else {
+		tree, err = buildFairLocatorTree(fixture.forest.layout)
+	}
+	stopPhase()
 	if err != nil {
 		return fmt.Errorf("build ALL locator tree: %w", err)
 	}
@@ -354,6 +379,8 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("new ALL update writer: %w", err)
 	}
+	stopPhase = fairPhase("ALL: persist the locator tree to Cassandra")
+	defer func() { stopPhase() }()
 	if err := persistFairLocatorTree(ctx, writer, tree); err != nil {
 		return fmt.Errorf("persist ALL locator tree: %w", err)
 	}
@@ -362,25 +389,25 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 	return nil
 }
 
-// resolveLocator makes one native ALL query, verifies its proof over the
-// whole range (all tenants), filters a named tenant (FilterTenant), then
-// converts the authenticated values to the physical HPP request. It returns
-// the addresses and the number of entries in the authenticated range.
+// resolveLocator makes one bounded logical ALL query, verifies its proof,
+// then converts its authenticated values to the physical HPP request.
 func (fixture *persistentFairHMFFixture) resolveLocator(ctx context.Context,
-	native fairHMFNativeQuery) ([]hpp.PhysicalAddress, int, error) {
-	result, err := fixture.allRepo.ResolveLocatorQuery(ctx, fairLocatorTreeID, fixture.locatorRoot, native.Query)
+	placement string, count int) ([]hpp.PhysicalAddress, error) {
+	query, err := fairLocatorQuery(placement, count)
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve ALL locator query: %w", err)
+		return nil, err
 	}
-	if err := locator.VerifyLocatorQueryResult(native.Query, result, fixture.locatorRoot); err != nil {
-		return nil, 0, fmt.Errorf("verify ALL locator proof: %w", err)
+	result, err := fixture.allRepo.ResolveLocatorQuery(ctx, fairLocatorTreeID, fixture.locatorRoot, query)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ALL locator query: %w", err)
 	}
-	entries := native.Query.FilterTenant(result.Entries)
-	if len(entries) != native.Q {
-		return nil, 0, fmt.Errorf("ALL returned %d logs for %s, want %d", len(entries), native.name(), native.Q)
+	if err := locator.VerifyLocatorQueryResult(query, result, fixture.locatorRoot); err != nil {
+		return nil, fmt.Errorf("verify ALL locator proof: %w", err)
 	}
-	addresses, err := fairPhysicalAddresses(fixture.forest.layout, entries)
-	return addresses, len(result.Entries), err
+	if len(result.Entries) != count {
+		return nil, fmt.Errorf("ALL returned %d addresses for %s/q=%d", len(result.Entries), placement, count)
+	}
+	return fairPhysicalAddresses(fixture.forest.layout, result.Entries)
 }
 
 // copyLogsFromDataset streams the shared dataset into hmf.encrypted_logs in
@@ -435,8 +462,8 @@ func (fixture *persistentFairHMFFixture) verify(ctx context.Context,
 // verifyWorkload times the complete verification instance from one logical
 // ALL query through HPP proof construction and anchored-root verification.
 func (fixture *persistentFairHMFFixture) verifyWorkload(ctx context.Context,
-	native fairHMFNativeQuery) (hpp.VerificationResult, error) {
-	addresses, _, err := fixture.resolveLocator(ctx, native)
+	placement string, count int) (hpp.VerificationResult, error) {
+	addresses, err := fixture.resolveLocator(ctx, placement, count)
 	if err != nil {
 		return hpp.VerificationResult{}, err
 	}

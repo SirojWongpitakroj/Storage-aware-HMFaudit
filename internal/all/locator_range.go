@@ -19,13 +19,12 @@ type pathStep struct {
 }
 
 // Bounds converts an exact-prefix logical query into a half-open ALL key
-// range. The bounds carry an empty TenantID and a zero LogID, which sort before
-// every real tenant and log, so the range includes every log at StartTime
-// (all tenants) and excludes every log at EndTime. TenantID is not part of
-// the range; see FilterTenant.
+// range. The first four key fields are exact matches and the event time is a
+// half-open interval. A zero LogID includes every log at StartTime and excludes
+// every log at EndTime.
 func (query LocatorQuery) Bounds() (LocatorKey, LocatorKey, error) {
-	if query.ServiceID == "" || query.LogType == "" || query.RegionID == "" {
-		return LocatorKey{}, LocatorKey{}, fmt.Errorf("locator query: service, log type, and region are required")
+	if query.TenantID == "" || query.ServiceID == "" || query.LogType == "" || query.RegionID == "" {
+		return LocatorKey{}, LocatorKey{}, fmt.Errorf("locator query: tenant, service, log type, and region are required")
 	}
 	if query.StartTime.IsZero() || query.EndTime.IsZero() {
 		return LocatorKey{}, LocatorKey{}, fmt.Errorf("locator query: start and end times are required")
@@ -35,6 +34,7 @@ func (query LocatorQuery) Bounds() (LocatorKey, LocatorKey, error) {
 	}
 
 	key := LocatorKey{
+		TenantID:  query.TenantID,
 		ServiceID: query.ServiceID,
 		LogType:   query.LogType,
 		RegionID:  query.RegionID,
@@ -45,24 +45,6 @@ func (query LocatorQuery) Bounds() (LocatorKey, LocatorKey, error) {
 	upper := key
 	upper.EventTime = query.EndTime
 	return lower, upper, nil
-}
-
-// FilterTenant returns the entries of a verified result that belong to the
-// query's tenant, or all of them when the query names no tenant. Verify the
-// result first (VerifyLocatorQueryResult): the proof covers the whole range, so
-// completeness is established before any filtering, and the filter only
-// narrows a result that is already authenticated.
-func (query LocatorQuery) FilterTenant(entries []LocatorEntry) []LocatorEntry {
-	if query.TenantID == "" {
-		return entries
-	}
-	selected := make([]LocatorEntry, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Key.TenantID == query.TenantID {
-			selected = append(selected, entry)
-		}
-	}
-	return selected
 }
 
 // Resolve converts a logical query into key bounds and resolves it against

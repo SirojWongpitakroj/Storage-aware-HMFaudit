@@ -70,7 +70,7 @@ func TestBulkLoadBuildsTheSameTreeAsIncrementalInserts(t *testing.T) {
 		compare(incremental.RootPage, bulk.RootPage)
 
 		// A bulk-loaded tree answers and proves queries like any other.
-		query := LocatorQuery{ServiceID: "svc-a", LogType: "INFO", RegionID: "R0",
+		query := LocatorQuery{TenantID: "T0", ServiceID: "svc-a", LogType: "INFO", RegionID: "R0",
 			StartTime: time.Unix(1_500_000_010, 0).UTC(), EndTime: time.Unix(1_500_000_030, 0).UTC()}
 		result, err := bulk.Resolve(query)
 		if err != nil {

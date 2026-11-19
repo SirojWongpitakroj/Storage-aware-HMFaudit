@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/bits"
 	"strconv"
+	"time"
 
 	locator "github.com/SirojWongpitakroj/hmf-audit/internal/all"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
@@ -17,11 +18,21 @@ import (
 const fairLocatorTreeID = locator.LocatorTreeID
 
 const (
-	fairVerificationMaxCount = 1 << 12
+	fairLocatorTenantID              = "fair-benchmark"
+	fairLocatorBackgroundServiceID   = "background"
+	fairLocatorVerificationServiceID = "verification"
+	fairLocatorLogicalRegionID       = "benchmark-logical"
+	fairLocatorLogType               = "log"
+	fairVerificationMaxCount         = 1 << 14
 
 	fairLocatorOrder          = 128
 	fairLocatorPagesPerBucket = 512
 )
+
+// fairEventTime gives each workload's logical rank a unique ALL time key.
+func fairEventTime(ordinal int) time.Time {
+	return time.Unix(int64(ordinal), 0).UTC()
+}
 
 // fairVerificationOrdinals assigns a logical prefix to distinct physical
 // records. The first group spans two adjacent R0 segments; the second spreads
@@ -62,30 +73,55 @@ func fairVerificationOrdinals(layout *fairLayout, placement string, count int) (
 	return result, nil
 }
 
-// buildFairLocatorTree persists one locator entry per dataset record under
-// the record's real ALL key -- (service, log type, region, event time,
-// tenant, log ID) from the shared dataset -- with its physical address as the
-// value, so native queries resolve exactly as in a production deployment.
-func buildFairLocatorTree(layout *fairLayout, attributes *fairHMFAttributes) (*locator.LocatorTree, error) {
-	total := layout.total()
-	if attributes == nil || len(attributes.eventTime) != total {
-		return nil, fmt.Errorf("build ALL: attributes for %d records are required", total)
+// buildFairLocatorTree persists one locator entry per dataset record. The
+// benchmark's two adjacent logical windows each contain q-max records in
+// rank order under the same service and logical region. Only their physical
+// locator values differ; all other records are background entries.
+func buildFairLocatorTree(layout *fairLayout) (*locator.LocatorTree, error) {
+	type assignment struct {
+		rank int
 	}
-	// Setup only: bulk loading builds exactly the tree of one Insert per
-	// record (same pages and root) but hashes each page once at the end.
+	selected := make(map[int]assignment, 2*fairVerificationMaxCount)
+	for _, placement := range fairBenchmarkPlacements {
+		logicalStart, err := fairLogicalStart(placement)
+		if err != nil {
+			return nil, err
+		}
+		ordinals, err := fairVerificationOrdinals(layout, placement, fairVerificationMaxCount)
+		if err != nil {
+			return nil, err
+		}
+		for rank, ordinal := range ordinals {
+			if previous, exists := selected[ordinal]; exists {
+				return nil, fmt.Errorf("physical ordinal %d has duplicate logical ranks %d and %d", ordinal, previous.rank, logicalStart+rank)
+			}
+			selected[ordinal] = assignment{rank: logicalStart + rank}
+		}
+	}
 	tree := locator.NewLocatorTree(fairLocatorOrder)
-	tree.BeginBulkLoad()
+	total := layout.total()
 	for ordinal := 0; ordinal < total; ordinal++ {
 		address := layout.address(ordinal)
+		service, region, rank := fairLocatorBackgroundServiceID, address.RegionID, ordinal
+		if selectedRecord, ok := selected[ordinal]; ok {
+			service, region, rank = fairLocatorVerificationServiceID, fairLocatorLogicalRegionID, selectedRecord.rank
+		}
+		key := locator.LocatorKey{
+			LogID:     fairHMFUUID(ordinal),
+			EventTime: fairEventTime(rank),
+			RegionID:  region,
+			TenantID:  fairLocatorTenantID,
+			ServiceID: service,
+			LogType:   fairLocatorLogType,
+		}
 		value := &locator.LocatorValue{
 			RegionID:  address.RegionID,
 			ShardID:   fmt.Sprintf("%d", address.ShardID),
 			SegmentID: fmt.Sprintf("%d", address.SegmentID),
 			LeafID:    fmt.Sprintf("%d", address.LeafID),
 		}
-		tree.Insert(attributes.key(layout, ordinal), value, tree.RootPage)
+		tree.Insert(key, value, tree.RootPage)
 	}
-	tree.FinishBulkLoad()
 	return tree, nil
 }
 
@@ -95,6 +131,37 @@ func persistFairLocatorTree(ctx context.Context, writer *cassandrastore.ALLUpdat
 	tree *locator.LocatorTree) error {
 
 	return writer.PersistSnapshot(ctx, tree)
+}
+
+func fairLogicalStart(placement string) (int, error) {
+	switch placement {
+	case "clustered-2":
+		return 0, nil
+	case "scattered":
+		return fairVerificationMaxCount, nil
+	default:
+		return 0, fmt.Errorf("unknown verification placement %q", placement)
+	}
+}
+
+// fairLocatorQuery asks ALL for one contiguous logical prefix of a fixed-
+// size window. Both cases use the same index dimensions and range width.
+func fairLocatorQuery(placement string, count int) (locator.LocatorQuery, error) {
+	if count <= 0 || count > fairVerificationMaxCount {
+		return locator.LocatorQuery{}, fmt.Errorf("fair locator query: invalid count %d", count)
+	}
+	start, err := fairLogicalStart(placement)
+	if err != nil {
+		return locator.LocatorQuery{}, err
+	}
+	return locator.LocatorQuery{
+		TenantID:  fairLocatorTenantID,
+		ServiceID: fairLocatorVerificationServiceID,
+		LogType:   fairLocatorLogType,
+		RegionID:  fairLocatorLogicalRegionID,
+		StartTime: fairEventTime(start),
+		EndTime:   fairEventTime(start + count),
+	}, nil
 }
 
 func fairPhysicalAddresses(layout *fairLayout, entries []locator.LocatorEntry) ([]hpp.PhysicalAddress, error) {
@@ -118,7 +185,7 @@ func fairPhysicalAddresses(layout *fairLayout, entries []locator.LocatorEntry) (
 		}
 		address := hpp.PhysicalAddress{RegionID: entry.Value.RegionID, ShardID: shard, SegmentID: segment, LeafID: leaf}
 		ordinal, valid := layout.ordinal(address)
-		if !valid || entry.Key.LogID != fairHMFUUID(ordinal) || entry.Key.RegionID != address.RegionID {
+		if !valid || entry.Key.LogID != fairHMFUUID(ordinal) || entry.Key.RegionID != fairLocatorLogicalRegionID {
 			return nil, fmt.Errorf("ALL entry %v is not bound to physical address %+v", entry.Key.LogID, address)
 		}
 		if _, duplicate := seen[address]; duplicate {

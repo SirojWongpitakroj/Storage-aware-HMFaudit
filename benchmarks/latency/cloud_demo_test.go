@@ -19,6 +19,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// fairCloudDemoRecord is the part of a dataset line the cloud demo selects on.
+type fairCloudDemoRecord struct {
+	RegionID  string `json:"region_id"`
+	TenantID  string `json:"tenant_id"`
+	ServiceID string `json:"service_id"`
+	LogType   string `json:"log_type"`
+	EventTime string `json:"event_time"`
+}
+
 // TestCloudDemoVerification reads the existing fair fixture. The source digest
 // pins the attributes and the leaves used to rebuild the independent HMF root.
 func TestCloudDemoVerification(t *testing.T) {
@@ -60,7 +69,7 @@ func TestCloudDemoVerification(t *testing.T) {
 			t.Fatal("source has more than 10 million records")
 		}
 		var record struct {
-			fairHMFAttributeRecord
+			fairCloudDemoRecord
 			RawLog string `json:"raw_log"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {

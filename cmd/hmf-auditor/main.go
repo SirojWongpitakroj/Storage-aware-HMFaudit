@@ -37,6 +37,7 @@ import (
 	"github.com/SirojWongpitakroj/hmf-audit/internal/checkpoint"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/domain"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
+	"github.com/SirojWongpitakroj/hmf-audit/internal/localization"
 	cassandrastore "github.com/SirojWongpitakroj/hmf-audit/internal/storage/cassandra"
 	"github.com/SirojWongpitakroj/hmf-audit/internal/storage/postgresql"
 )
@@ -88,7 +89,7 @@ func main() {
 }
 
 func run() (int, error) {
-	tenant := flag.String("tenant", "", "tenant_id (optional; omit it to query all tenants with a single query)")
+	tenant := flag.String("tenant", "", "tenant_id (required)")
 	service := flag.String("service", "", "service_id (required)")
 	logType := flag.String("log-type", "", "log_type (required)")
 	region := flag.String("region", "", "region_id (required)")
@@ -104,10 +105,15 @@ func run() (int, error) {
 	limit := flag.Int("limit", 20, "rows to print in table mode (the summary always counts all)")
 	asJSON := flag.Bool("json", false, "print every log as one JSON line")
 	repeats := flag.Int("repeats", 0, "after the normal run (the warm-up), repeat steps 2-3 silently this many times and print the median time; connection set-up is not timed")
+	reuseLocator := flag.Bool("reuse-locator", false, "reuse the initial authenticated locator result in timed runs and print verification progress")
+	localize := flag.Bool("localize", false, "detect and localize failed proofs with the HMF localization service")
 	flag.Parse()
+	if *localize {
+		*reuseLocator = true
+	}
 
-	if *service == "" || *logType == "" || *region == "" {
-		return 0, fmt.Errorf("-service, -log-type and -region are required (-tenant is optional)")
+	if *tenant == "" || *service == "" || *logType == "" || *region == "" {
+		return 0, fmt.Errorf("-tenant, -service, -log-type and -region are required")
 	}
 	query, err := buildQuery(*tenant, *service, *logType, *region, *start, *end, *at)
 	if err != nil {
@@ -161,6 +167,9 @@ func run() (int, error) {
 	}
 
 	// 2. Attribute query through the locator, verified against R_L.
+	if *reuseLocator {
+		fmt.Println("progress: authenticating the ALL locator range")
+	}
 	result, err := cassandrastore.NewALLRepo(session).ResolveLocatorQuery(ctx, trusted.LocatorTreeID, trusted.LocatorRoot, query)
 	if err != nil {
 		return 0, fmt.Errorf("resolve the locator query: %w", err)
@@ -172,21 +181,24 @@ func run() (int, error) {
 	}
 	fmt.Printf("checkpoint %d  (R_L %s...  R_G %s...)\n", trusted.Sequence,
 		hex.EncodeToString(trusted.LocatorRoot[:4]), hex.EncodeToString(trusted.GlobalHMFRoot[:4]))
-	tenantLabel := query.TenantID
-	if tenantLabel == "" {
-		tenantLabel = "* (all tenants, one query)"
-	}
-	fmt.Printf("query: tenant=%s service=%s log_type=%s region=%s time=[%s, %s)\n", tenantLabel, query.ServiceID,
+	fmt.Printf("query: tenant=%s service=%s log_type=%s region=%s time=[%s, %s)\n", query.TenantID, query.ServiceID,
 		query.LogType, query.RegionID, query.StartTime.Format(time.RFC3339), query.EndTime.Format(time.RFC3339))
-	// The proof covers the whole range, so the filter below only narrows an
-	// already-verified result (it is the identity when no tenant is given).
-	entries := query.FilterTenant(result.Entries)
+	// The tenant leads the key order, so the verified range holds only this tenant's logs.
+	entries := result.Entries
 	fmt.Printf("locator proof verified: %d matching log(s), none omitted\n", len(entries))
+	if *reuseLocator {
+		fmt.Printf("progress: ALL authenticated %d log ID(s) at checkpoint %d\n", len(entries), trusted.Sequence)
+	}
 	if len(entries) == 0 {
 		return 0, nil
 	}
 
 	// 3. Evidence: current stored rows, then the HMF proof.
+	if *localize {
+		fmt.Println("progress: detecting and localizing tampering (warm-up)")
+	} else if *reuseLocator {
+		fmt.Println("progress: verifying the stored logs (warm-up)")
+	}
 	candidates, err := collect(ctx, postgresql.NewLogRepository(pool), entries)
 	if err != nil {
 		return 0, err
@@ -206,23 +218,34 @@ func run() (int, error) {
 			provable = append(provable, item)
 		}
 	}
-	if err := auditor.verify(ctx, provable); err != nil {
+	verifyBatch := (*groupVerifier).verify
+	if *localize {
+		verifyBatch = (*groupVerifier).localize
+	}
+	if err := verifyBatch(auditor, ctx, provable); err != nil {
 		return 0, err
 	}
 
 	timingLine := ""
 	if *repeats > 0 {
 		runs := make([]float64, 0, *repeats)
-		for range *repeats {
+		for trial := range *repeats {
+			if *reuseLocator {
+				fmt.Printf("progress: timed run %d/%d\n", trial+1, *repeats)
+			}
 			begin := time.Now()
-			again, err := cassandrastore.NewALLRepo(session).ResolveLocatorQuery(ctx, trusted.LocatorTreeID, trusted.LocatorRoot, query)
-			if err != nil {
-				return 0, err
+			timedEntries := entries
+			if !*reuseLocator {
+				again, err := cassandrastore.NewALLRepo(session).ResolveLocatorQuery(ctx, trusted.LocatorTreeID, trusted.LocatorRoot, query)
+				if err != nil {
+					return 0, err
+				}
+				if err := locator.VerifyLocatorQueryResult(query, again, trusted.LocatorRoot); err != nil {
+					return 0, err
+				}
+				timedEntries = again.Entries
 			}
-			if err := locator.VerifyLocatorQueryResult(query, again, trusted.LocatorRoot); err != nil {
-				return 0, err
-			}
-			rows, err := collect(ctx, postgresql.NewLogRepository(pool), query.FilterTenant(again.Entries))
+			rows, err := collect(ctx, postgresql.NewLogRepository(pool), timedEntries)
 			if err != nil {
 				return 0, err
 			}
@@ -232,14 +255,30 @@ func run() (int, error) {
 					usable = append(usable, item)
 				}
 			}
-			if err := (&groupVerifier{service: hppService, trustedRoot: trusted.GlobalHMFRoot}).verify(ctx, usable); err != nil {
+			if err := verifyBatch(&groupVerifier{service: hppService, trustedRoot: trusted.GlobalHMFRoot}, ctx, usable); err != nil {
 				return 0, err
 			}
 			runs = append(runs, float64(time.Since(begin).Microseconds())/1000)
+			if *reuseLocator {
+				for index, row := range rows {
+					if (row.failure == "") != (candidates[index].failure == "") {
+						return 0, fmt.Errorf("verification outcome changed between runs for log %s", row.entry.Key.LogID)
+					}
+				}
+			}
 		}
 		sorted := slices.Clone(runs)
 		slices.Sort(sorted)
 		timingLine = fmt.Sprintf("timing: median_ms=%.3f repeats=%d runs_ms=%v", sorted[len(sorted)/2], *repeats, runs)
+	}
+	if *reuseLocator {
+		current, err := reader.Current(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if current.Sequence != trusted.Sequence || current.StateCommitment != trusted.StateCommitment {
+			return 0, fmt.Errorf("checkpoint changed during verification")
+		}
 	}
 
 	verdicts := make([]verdict, 0, len(candidates))
@@ -438,6 +477,62 @@ func (verifier *groupVerifier) verify(ctx context.Context, group []*candidate) e
 }
 
 func (verifier *groupVerifier) check(ctx context.Context, group []*candidate) (bool, error) {
+	proof, addresses, err := verifier.proofForStoredRows(ctx, group)
+	if err != nil {
+		return false, err
+	}
+	if _, err := hpp.VerifyHMFProofAgainstRoot(proof, addresses, verifier.trustedRoot); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (verifier *groupVerifier) localize(ctx context.Context, group []*candidate) error {
+	if len(group) == 0 {
+		return nil
+	}
+	proof, addresses, err := verifier.proofForStoredRows(ctx, group)
+	if err != nil {
+		return err
+	}
+	root, err := hpp.VerifyHMFProof(proof, addresses)
+	if err != nil || root == verifier.trustedRoot {
+		return err
+	}
+	service, err := localization.NewService(verifier.service)
+	if err != nil {
+		return err
+	}
+	result, err := service.Localize(ctx, localization.Request{
+		Addresses: addresses, AuditorGlobalRoot: root, FailedProof: proof, AnchoredGlobalRoot: verifier.trustedRoot,
+	})
+	if err != nil {
+		return err
+	}
+	if err := localization.VerifyProof(result.Proof, addresses, verifier.trustedRoot); err != nil {
+		return err
+	}
+	byAddress := make(map[hpp.PhysicalAddress]*candidate, len(group))
+	for _, item := range group {
+		byAddress[item.address] = item
+	}
+	for _, suspect := range result.Proof.Suspects {
+		if suspect.Address == nil || suspect.Classification != localization.LeafMismatch {
+			return fmt.Errorf("localization found %s outside the requested log leaves", suspect.Classification)
+		}
+		item := byAddress[*suspect.Address]
+		if item == nil {
+			return fmt.Errorf("localization found an unrequested log address: %+v", *suspect.Address)
+		}
+		item.failure = "stored log does not match the digest committed under the anchored root"
+	}
+	if len(result.Proof.Suspects) == 0 {
+		return fmt.Errorf("localization did not identify any mismatched leaves")
+	}
+	return nil
+}
+
+func (verifier *groupVerifier) proofForStoredRows(ctx context.Context, group []*candidate) (hpp.HMFProof, []hpp.PhysicalAddress, error) {
 	addresses := make([]hpp.PhysicalAddress, len(group))
 	digests := make(map[hpp.PhysicalAddress][32]byte, len(group))
 	byAddress := make(map[hpp.PhysicalAddress]*candidate, len(group))
@@ -449,12 +544,12 @@ func (verifier *groupVerifier) check(ctx context.Context, group []*candidate) (b
 	proof, err := verifier.service.BuildProof(ctx, addresses)
 	verifier.proofs++
 	if err != nil {
-		return false, fmt.Errorf("build HMF proof: %w", err)
+		return hpp.HMFProof{}, nil, fmt.Errorf("build HMF proof: %w", err)
 	}
 	for index := range proof.Leaves {
 		digest, ok := digests[proof.Leaves[index].Address]
 		if !ok {
-			return false, fmt.Errorf("proof contains unrequested address %+v", proof.Leaves[index].Address)
+			return hpp.HMFProof{}, nil, fmt.Errorf("proof contains unrequested address %+v", proof.Leaves[index].Address)
 		}
 		// The leaf the proof arrives with is the one the hierarchy committed;
 		// keep it for the report, then substitute the stored row's digest.
@@ -462,10 +557,7 @@ func (verifier *groupVerifier) check(ctx context.Context, group []*candidate) (b
 		byAddress[proof.Leaves[index].Address].hasCommitted = true
 		proof.Leaves[index].Hash = digest
 	}
-	if _, err := hpp.VerifyHMFProofAgainstRoot(proof, addresses, verifier.trustedRoot); err != nil {
-		return false, nil
-	}
-	return true, nil
+	return proof, addresses, nil
 }
 
 func print(verdicts []verdict, asJSON bool, limit int) {

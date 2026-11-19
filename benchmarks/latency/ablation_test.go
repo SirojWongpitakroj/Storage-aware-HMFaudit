@@ -174,7 +174,7 @@ func runAblationOnce(ctx context.Context, fixture *persistentFairHMFFixture,
 	native fairHMFNativeQuery) (ablationExecution, error) {
 
 	started := time.Now()
-	addresses, _, err := fixture.resolveLocator(ctx, native)
+	addresses, _, err := fixture.resolveNative(ctx, native, false)
 	if err != nil {
 		return ablationExecution{}, fmt.Errorf("resolve locator: %w", err)
 	}
@@ -518,9 +518,19 @@ func TestFairHMFAblation(t *testing.T) {
 	if dir == "" {
 		t.Fatal("FAIR_NATIVE_QUERIES_DIR is required: the ablation runs HMF-Audit's native query set")
 	}
-	queries, err := loadFairHMFNativeQueries(dir, ablationBatchSizes(t))
+	allQueries, err := fairHMFNativeQueries(dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	wanted := map[int]bool{}
+	for _, q := range ablationBatchSizes(t) {
+		wanted[q] = true
+	}
+	var queries []fairHMFNativeQuery
+	for _, native := range allQueries {
+		if wanted[native.Q] {
+			queries = append(queries, native)
+		}
 	}
 	ctx := context.Background()
 	for _, native := range queries {
