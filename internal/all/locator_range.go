@@ -506,13 +506,7 @@ func ReconstructLocatorRoot(proof LocatorLeafProof) ([32]byte, error) {
 			return [32]byte{}, fmt.Errorf("reconstruct locator root: child index %d out of range for page %d", step.ChildIndex, step.PageID)
 		}
 
-		children := make([]*Page, len(step.ChildHashes))
-		for index, hash := range step.ChildHashes {
-			children[index] = &Page{Hash: hash}
-		}
-		children[step.ChildIndex].Hash = current
-		parent := Page{Keys: step.Keys, Children: children}
-		current = parent.internalHash()
+		current = internalHashOf(step.Keys, step.ChildHashes, step.ChildIndex, current)
 	}
 	return current, nil
 }

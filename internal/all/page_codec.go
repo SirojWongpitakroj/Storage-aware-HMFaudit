@@ -52,9 +52,9 @@ func MarshalPage(page Page) ([]byte, error) {
 // UnmarshalPage restores the page contents stored in page_data. The caller
 // restores PageID, Hash, ParentPageID, and Next from their Cassandra columns.
 func UnmarshalPage(data []byte) (Page, error) {
-	reader := bytes.NewReader(data)
+	reader := &pageCursor{data: data}
 
-	version, err := reader.ReadByte()
+	version, err := reader.readByte()
 	if err != nil {
 		return Page{}, fmt.Errorf("unmarshal page: read format version: %w", err)
 	}
@@ -62,7 +62,7 @@ func UnmarshalPage(data []byte) (Page, error) {
 		return Page{}, fmt.Errorf("unmarshal page: unsupported format version %d", version)
 	}
 
-	isLeaf, err := reader.ReadByte()
+	isLeaf, err := reader.readByte()
 	if err != nil {
 		return Page{}, fmt.Errorf("unmarshal page: read page type: %w", err)
 	}
@@ -70,16 +70,16 @@ func UnmarshalPage(data []byte) (Page, error) {
 		return Page{}, fmt.Errorf("unmarshal page: invalid page type %d", isLeaf)
 	}
 
-	keyCount, err := readUint32(reader)
+	keyCount, err := reader.readUint32()
 	if err != nil {
 		return Page{}, fmt.Errorf("unmarshal page: read key count: %w", err)
 	}
-	if uint64(keyCount) > uint64(reader.Len()/4) {
+	if uint64(keyCount) > uint64(reader.remaining()/4) {
 		return Page{}, fmt.Errorf("unmarshal page: invalid key count %d", keyCount)
 	}
 	keys := make([]LocatorKey, 0, keyCount)
 	for range keyCount {
-		keyData, err := readBytes(reader)
+		keyData, err := reader.readBytes()
 		if err != nil {
 			return Page{}, fmt.Errorf("unmarshal page: read key: %w", err)
 		}
@@ -95,12 +95,12 @@ func UnmarshalPage(data []byte) (Page, error) {
 		Keys:   keys,
 	}
 	if page.IsLeaf {
-		if uint64(keyCount) > uint64(reader.Len()/4) {
+		if uint64(keyCount) > uint64(reader.remaining()/4) {
 			return Page{}, fmt.Errorf("unmarshal page: invalid value count %d", keyCount)
 		}
 		page.Values = make([]*LocatorValue, 0, keyCount)
 		for range keyCount {
-			valueData, err := readBytes(reader)
+			valueData, err := reader.readBytes()
 			if err != nil {
 				return Page{}, fmt.Errorf("unmarshal page: read value: %w", err)
 			}
@@ -112,24 +112,27 @@ func UnmarshalPage(data []byte) (Page, error) {
 		}
 	} else {
 		childCount := uint64(keyCount) + 1
-		if childCount > uint64(reader.Len()/40) {
+		if childCount > uint64(reader.remaining()/40) {
 			return Page{}, fmt.Errorf("unmarshal page: invalid child count %d", childCount)
 		}
-		page.Children = make([]*Page, 0, keyCount+1)
-		for range keyCount + 1 {
-			pageID, err := readInt64(reader)
+		// One backing array for every child, instead of one allocation per child.
+		children := make([]Page, childCount)
+		page.Children = make([]*Page, 0, childCount)
+		for index := range children {
+			pageID, err := reader.readInt64()
 			if err != nil {
 				return Page{}, fmt.Errorf("unmarshal page: read child page ID: %w", err)
 			}
-			child := &Page{PageID: pageID}
-			if _, err := io.ReadFull(reader, child.Hash[:]); err != nil {
+			child := &children[index]
+			child.PageID = pageID
+			if err := reader.readFull(child.Hash[:]); err != nil {
 				return Page{}, fmt.Errorf("unmarshal page: read child hash: %w", err)
 			}
 			page.Children = append(page.Children, child)
 		}
 	}
 
-	if reader.Len() != 0 {
+	if reader.remaining() != 0 {
 		return Page{}, fmt.Errorf("unmarshal page: unexpected trailing data")
 	}
 	return page, nil
@@ -174,32 +177,32 @@ func copyInt64Pointer(value *int64) *int64 {
 }
 
 func unmarshalKey(data []byte) (LocatorKey, error) {
-	reader := bytes.NewReader(data)
-	tenantID, err := readString(reader)
+	reader := &pageCursor{data: data}
+	tenantID, err := reader.readString()
 	if err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: tenant ID: %w", err)
 	}
-	serviceID, err := readString(reader)
+	serviceID, err := reader.readString()
 	if err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: service ID: %w", err)
 	}
-	logType, err := readString(reader)
+	logType, err := reader.readString()
 	if err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: log type: %w", err)
 	}
-	regionID, err := readString(reader)
+	regionID, err := reader.readString()
 	if err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: region ID: %w", err)
 	}
-	eventTime, err := readInt64(reader)
+	eventTime, err := reader.readInt64()
 	if err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: event time: %w", err)
 	}
 	var logID uuid.UUID
-	if _, err := io.ReadFull(reader, logID[:]); err != nil {
+	if err := reader.readFull(logID[:]); err != nil {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: log ID: %w", err)
 	}
-	if reader.Len() != 0 {
+	if reader.remaining() != 0 {
 		return LocatorKey{}, fmt.Errorf("unmarshal key: unexpected trailing data")
 	}
 
@@ -214,13 +217,13 @@ func unmarshalKey(data []byte) (LocatorKey, error) {
 }
 
 func unmarshalValue(data []byte) (*LocatorValue, error) {
-	reader := bytes.NewReader(data)
-	present, err := reader.ReadByte()
+	reader := &pageCursor{data: data}
+	present, err := reader.readByte()
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal value: read presence: %w", err)
 	}
 	if present == 0 {
-		if reader.Len() != 0 {
+		if reader.remaining() != 0 {
 			return nil, fmt.Errorf("unmarshal value: unexpected trailing data")
 		}
 		return nil, nil
@@ -229,23 +232,23 @@ func unmarshalValue(data []byte) (*LocatorValue, error) {
 		return nil, fmt.Errorf("unmarshal value: invalid presence %d", present)
 	}
 
-	regionID, err := readString(reader)
+	regionID, err := reader.readString()
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal value: region ID: %w", err)
 	}
-	shardID, err := readString(reader)
+	shardID, err := reader.readString()
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal value: shard ID: %w", err)
 	}
-	segmentID, err := readString(reader)
+	segmentID, err := reader.readString()
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal value: segment ID: %w", err)
 	}
-	leafID, err := readString(reader)
+	leafID, err := reader.readString()
 	if err != nil {
 		return nil, fmt.Errorf("unmarshal value: leaf ID: %w", err)
 	}
-	if reader.Len() != 0 {
+	if reader.remaining() != 0 {
 		return nil, fmt.Errorf("unmarshal value: unexpected trailing data")
 	}
 
@@ -270,40 +273,73 @@ func writeBytes(data *bytes.Buffer, value []byte) {
 	data.Write(value)
 }
 
-func readUint32(reader *bytes.Reader) (uint32, error) {
-	var value uint32
-	if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
-		return 0, err
+// pageCursor reads big-endian fields from a byte slice without copying or reflection. Its errors are
+// those of bytes.Reader with encoding/binary and io.ReadFull: io.EOF when nothing is left, and
+// io.ErrUnexpectedEOF when a field is cut short.
+type pageCursor struct{ data []byte }
+
+func (c *pageCursor) remaining() int { return len(c.data) }
+
+func (c *pageCursor) take(n int) ([]byte, error) {
+	if len(c.data) == 0 && n > 0 {
+		return nil, io.EOF
 	}
-	return value, nil
+	if len(c.data) < n {
+		c.data = nil
+		return nil, io.ErrUnexpectedEOF
+	}
+	taken := c.data[:n:n]
+	c.data = c.data[n:]
+	return taken, nil
 }
 
-func readInt64(reader *bytes.Reader) (int64, error) {
-	var value int64
-	if err := binary.Read(reader, binary.BigEndian, &value); err != nil {
+func (c *pageCursor) readByte() (byte, error) {
+	taken, err := c.take(1)
+	if err != nil {
 		return 0, err
 	}
-	return value, nil
+	return taken[0], nil
 }
 
-func readBytes(reader *bytes.Reader) ([]byte, error) {
-	length, err := readUint32(reader)
+func (c *pageCursor) readUint32() (uint32, error) {
+	taken, err := c.take(4)
+	if err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(taken), nil
+}
+
+func (c *pageCursor) readInt64() (int64, error) {
+	taken, err := c.take(8)
+	if err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(taken)), nil
+}
+
+func (c *pageCursor) readFull(dst []byte) error {
+	taken, err := c.take(len(dst))
+	if err != nil {
+		return err
+	}
+	copy(dst, taken)
+	return nil
+}
+
+// readBytes returns a length-prefixed field as a slice of the underlying data (not a copy).
+func (c *pageCursor) readBytes() ([]byte, error) {
+	length, err := c.readUint32()
 	if err != nil {
 		return nil, err
 	}
-	if uint64(length) > uint64(reader.Len()) {
+	if uint64(length) > uint64(len(c.data)) {
 		return nil, io.ErrUnexpectedEOF
 	}
-
-	value := make([]byte, length)
-	if _, err := io.ReadFull(reader, value); err != nil {
-		return nil, err
-	}
-	return value, nil
+	return c.take(int(length))
 }
 
-func readString(reader *bytes.Reader) (string, error) {
-	value, err := readBytes(reader)
+func (c *pageCursor) readString() (string, error) {
+	value, err := c.readBytes()
 	if err != nil {
 		return "", err
 	}

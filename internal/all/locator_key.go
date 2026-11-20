@@ -1,10 +1,7 @@
 // Package all implements Authenticated Log Locator
 package all
 
-import (
-	"bytes"
-	"encoding/binary"
-)
+import "encoding/binary"
 
 // Compare compares locator keys lexicographically by TenantID, ServiceID,
 // LogType, RegionID, EventTime, and LogID.
@@ -52,42 +49,35 @@ func (key *LocatorKey) Less(other LocatorKey) bool {
 	return key.Compare(other) < 0
 }
 
-func writeString(buf *bytes.Buffer, s string) {
-	binary.Write(buf, binary.BigEndian, uint32(len(s)))
-	buf.WriteString(s)
+// appendString appends a uint32 big-endian length and the string bytes.
+func appendString(dst []byte, s string) []byte {
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(s)))
+	return append(dst, s...)
 }
 
-func encodeKey(key LocatorKey) []byte {
-	var buf bytes.Buffer
-
-	writeString(&buf, key.TenantID)
-	writeString(&buf, key.ServiceID)
-	writeString(&buf, key.LogType)
-	writeString(&buf, key.RegionID)
-
-	//timestamp
-	binary.Write(
-		&buf, binary.BigEndian, key.EventTime.UnixNano(),
-	)
-
-	buf.Write(key.LogID[:])
-
-	return buf.Bytes()
+// appendKey appends the canonical key encoding: the tenant, service, log type and region as
+// length-prefixed strings, the event time in Unix nanoseconds (big-endian int64) and the 16 log-ID bytes.
+func appendKey(dst []byte, key LocatorKey) []byte {
+	dst = appendString(dst, key.TenantID)
+	dst = appendString(dst, key.ServiceID)
+	dst = appendString(dst, key.LogType)
+	dst = appendString(dst, key.RegionID)
+	dst = binary.BigEndian.AppendUint64(dst, uint64(key.EventTime.UnixNano()))
+	return append(dst, key.LogID[:]...)
 }
 
-func encodeValue(value *LocatorValue) []byte {
-	var buf bytes.Buffer
-
+// appendValue appends the canonical value encoding: 0 for no value, else 1 and four length-prefixed strings.
+func appendValue(dst []byte, value *LocatorValue) []byte {
 	if value == nil {
-		buf.WriteByte(0)
-		return buf.Bytes()
+		return append(dst, 0)
 	}
-
-	buf.WriteByte(1)
-	writeString(&buf, value.RegionID)
-	writeString(&buf, value.ShardID)
-	writeString(&buf, value.SegmentID)
-	writeString(&buf, value.LeafID)
-
-	return buf.Bytes()
+	dst = append(dst, 1)
+	dst = appendString(dst, value.RegionID)
+	dst = appendString(dst, value.ShardID)
+	dst = appendString(dst, value.SegmentID)
+	return appendString(dst, value.LeafID)
 }
+
+func encodeKey(key LocatorKey) []byte { return appendKey(nil, key) }
+
+func encodeValue(value *LocatorValue) []byte { return appendValue(nil, value) }
