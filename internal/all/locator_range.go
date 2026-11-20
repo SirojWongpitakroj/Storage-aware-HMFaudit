@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"sort"
+	"sync"
 	"uuid"
 )
 
@@ -115,6 +116,9 @@ func ResolveRangeWithReader(ctx context.Context, reader PageReader, rootPageID i
 	if err != nil {
 		return LocatorRangeResult{}, err
 	}
+	cache := reader.(*cachingPageReader)
+	waitPrefetch := startLeafPrefetch(ctx, cache, startPath, upper)
+	defer waitPrefetch()
 	startIndex := lowerBound(startLeaf.Keys, lower)
 	predecessor, err := predecessorEntry(ctx, reader, startLeaf, startIndex, startPath)
 	if err != nil {
@@ -699,28 +703,135 @@ func locatorEntryEqual(left, right LocatorEntry) bool {
 	return *left.Value == *right.Value
 }
 
+// pageFetchConcurrency is how many ALL pages one range resolution reads at once. It matches the
+// 8-wide request concurrency every scheme's reads use in the benchmark; 0 or 1 reads pages one by one.
+var pageFetchConcurrency = 8
+
+// cachingPageReader keeps the pages one request has read, so no page is fetched twice within a request
+// (nothing is kept between requests). Pages may be requested from several goroutines: a page that is
+// being fetched is awaited, not fetched again, and a failed fetch is not remembered.
 type cachingPageReader struct {
 	source PageReader
-	pages  map[int64]*Page
+	mu     sync.Mutex
+	pages  map[int64]*cachedPage
+}
+
+type cachedPage struct {
+	done chan struct{}
+	page *Page
+	err  error
 }
 
 func newCachingPageReader(source PageReader) *cachingPageReader {
-	return &cachingPageReader{source: source, pages: make(map[int64]*Page)}
+	return &cachingPageReader{source: source, pages: make(map[int64]*cachedPage)}
 }
 
 func (reader *cachingPageReader) ReadPage(ctx context.Context, pageID int64) (*Page, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if page, exists := reader.pages[pageID]; exists {
-		return page, nil
+	reader.mu.Lock()
+	entry, exists := reader.pages[pageID]
+	if !exists {
+		entry = &cachedPage{done: make(chan struct{})}
+		reader.pages[pageID] = entry
+		reader.mu.Unlock()
+		entry.page, entry.err = reader.source.ReadPage(ctx, pageID)
+		if entry.err != nil {
+			reader.mu.Lock()
+			delete(reader.pages, pageID)
+			reader.mu.Unlock()
+		}
+		close(entry.done)
+		return entry.page, entry.err
 	}
-	page, err := reader.source.ReadPage(ctx, pageID)
-	if err != nil {
-		return nil, err
+	reader.mu.Unlock()
+	select {
+	case <-entry.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	reader.pages[pageID] = page
-	return page, nil
+	return entry.page, entry.err
+}
+
+// startLeafPrefetch begins reading, concurrently, the leaf pages a range scan will need after startLeaf:
+// the right siblings of startLeaf under its parent, and under following parents, for as long as their
+// first key can lie below upper. Only page IDs from authenticated parent pages are used, and pages are
+// fetched into the request's page cache; the scan itself still follows the leaf chain, compares keys,
+// checks both boundaries and builds and verifies the proof exactly as before, so a page that was not
+// prefetched, or whose prefetch failed, is simply read when the scan reaches it. The returned function
+// waits for the prefetch to end.
+func startLeafPrefetch(ctx context.Context, reader *cachingPageReader, startPath []pathStep,
+	upper LocatorKey) (wait func()) {
+
+	if pageFetchConcurrency < 2 || len(startPath) == 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var fetches sync.WaitGroup
+		defer fetches.Wait()
+		slots := make(chan struct{}, pageFetchConcurrency)
+		fetch := func(pageID int64) {
+			slots <- struct{}{}
+			fetches.Add(1)
+			go func() {
+				defer fetches.Done()
+				defer func() { <-slots }()
+				_, _ = reader.ReadPage(ctx, pageID) // an error is reported by the scan's own read
+			}()
+		}
+
+		// path[i] is the page at depth i and the child taken under it; path's last page is the parent
+		// of the start leaf. advance moves it to the next such parent, climbing as far as needed.
+		path := append([]pathStep(nil), startPath...)
+		last := len(path) - 1
+		advance := func() bool {
+			for level := last - 1; level >= 0; level-- {
+				step := &path[level]
+				next := step.childIndex + 1
+				if next >= len(step.page.Children) {
+					continue
+				}
+				if step.page.Keys[next-1].Compare(upper) >= 0 {
+					return false // the next subtree starts at or after upper
+				}
+				step.childIndex = next
+				page, err := readChild(ctx, reader, step.page, next)
+				for depth := level + 1; err == nil && depth <= last; depth++ {
+					if page.IsLeaf {
+						return false
+					}
+					path[depth] = pathStep{page: page, childIndex: 0}
+					if depth < last {
+						page, err = readChild(ctx, reader, page, 0)
+					}
+				}
+				return err == nil
+			}
+			return false
+		}
+
+		parent, from := path[last].page, path[last].childIndex+1
+		for {
+			reachedEnd := true
+			for next := from; next < len(parent.Children); next++ {
+				if next > 0 && parent.Keys[next-1].Compare(upper) >= 0 {
+					reachedEnd = false // this child starts at or after upper
+					break
+				}
+				if child := parent.Children[next]; child != nil {
+					fetch(child.PageID)
+				}
+			}
+			if !reachedEnd || !advance() {
+				return
+			}
+			parent, from = path[last].page, 0
+		}
+	}()
+	return func() { <-done }
 }
 
 type memoryPageReader struct {
