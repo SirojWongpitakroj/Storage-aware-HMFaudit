@@ -1,8 +1,10 @@
 package hpp
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"strings"
 )
 
 type Service struct {
@@ -90,7 +92,72 @@ func (service *Service) ReferenceFromProof(ctx context.Context, proof HMFProof,
 
 // splitTargetLeaves separates the requested Segment leaves from the
 // authentication nodes, returning the leaves in plan address order.
+//
+// A reader that returns its nodes in canonical order (the Cassandra reader does) lets the leaves be
+// found by one merge walk against the sorted plan addresses, with no per-node map. Any other order,
+// a missing or duplicated leaf, or unsorted addresses fall back to the map-based split, which also
+// produces the errors.
 func splitTargetLeaves(addresses []PhysicalAddress, nodes []ProofNode) ([]RequestedLeaf, []ProofNode, error) {
+	if leaves, rest, ok := splitSortedTargetLeaves(addresses, nodes); ok {
+		return leaves, rest, nil
+	}
+	return splitTargetLeavesByMap(addresses, nodes)
+}
+
+// compareNodeRefs is the canonical node order: tree layer, region, shard, segment, level, index.
+func compareNodeRefs(left, right NodeRef) int {
+	if left.Tree.Layer != right.Tree.Layer {
+		return cmp.Compare(left.Tree.Layer, right.Tree.Layer)
+	}
+	if left.Tree.RegionID != right.Tree.RegionID {
+		return strings.Compare(left.Tree.RegionID, right.Tree.RegionID)
+	}
+	if left.Tree.ShardID != right.Tree.ShardID {
+		return cmp.Compare(left.Tree.ShardID, right.Tree.ShardID)
+	}
+	if left.Tree.SegmentID != right.Tree.SegmentID {
+		return cmp.Compare(left.Tree.SegmentID, right.Tree.SegmentID)
+	}
+	if left.Position.Level != right.Position.Level {
+		return cmp.Compare(left.Position.Level, right.Position.Level)
+	}
+	return cmp.Compare(left.Position.Index, right.Position.Index)
+}
+
+func splitSortedTargetLeaves(addresses []PhysicalAddress, nodes []ProofNode) ([]RequestedLeaf, []ProofNode, bool) {
+	for index := 1; index < len(addresses); index++ {
+		if compareAddresses(addresses[index-1], addresses[index]) >= 0 {
+			return nil, nil, false
+		}
+	}
+	leaves := make([]RequestedLeaf, 0, len(addresses))
+	rest := make([]ProofNode, 0, max(len(nodes)-len(addresses), 0))
+	for index := range nodes {
+		node := &nodes[index]
+		if index > 0 && compareNodeRefs(nodes[index-1].Ref, node.Ref) >= 0 {
+			return nil, nil, false
+		}
+		if next := len(leaves); next < len(addresses) && node.Ref.Tree.Layer == LayerSegment && node.Ref.Position.Level == 0 {
+			address := addresses[next]
+			target := PhysicalAddress{RegionID: node.Ref.Tree.RegionID, ShardID: node.Ref.Tree.ShardID,
+				SegmentID: node.Ref.Tree.SegmentID, LeafID: node.Ref.Position.Index}
+			switch order := compareAddresses(target, address); {
+			case order == 0:
+				leaves = append(leaves, RequestedLeaf{Address: address, Hash: node.Hash})
+				continue
+			case order > 0:
+				return nil, nil, false // the address has no leaf node
+			}
+		}
+		rest = append(rest, *node)
+	}
+	if len(leaves) != len(addresses) {
+		return nil, nil, false
+	}
+	return leaves, rest, true
+}
+
+func splitTargetLeavesByMap(addresses []PhysicalAddress, nodes []ProofNode) ([]RequestedLeaf, []ProofNode, error) {
 	targets := make(map[NodeRef]PhysicalAddress, len(addresses))
 	for _, address := range addresses {
 		key := SegmentKey{RegionID: address.RegionID, ShardID: address.ShardID, SegmentID: address.SegmentID}

@@ -2,6 +2,7 @@ package hpp
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -191,9 +192,7 @@ func planTree(tree TreeRef, leafCount int64, targetWeights map[int64]int64) (Tre
 		}
 		active = append(active, index)
 	}
-	sort.Slice(active, func(left, right int) bool { return active[left] < active[right] })
-	result := TreePlan{Tree: tree, LeafCount: leafCount, Targets: append([]int64(nil), active...)}
-
+	slices.Sort(active)
 	// weights[i] tracks how many of this batch's original addresses have
 	// merged into active[i] so far, seeded from targetWeights. Whenever two
 	// active siblings merge into one parent, their weights sum. When only one
@@ -207,6 +206,14 @@ func planTree(tree TreeRef, leafCount int64, targetWeights map[int64]int64) (Tre
 	for index, position := range active {
 		weights[index] = targetWeights[position]
 	}
+	return planSortedTree(tree, leafCount, active, weights)
+}
+
+// planSortedTree is planTree for targets already in ascending order: active holds the distinct target
+// indexes inside the tree and weights[i] the number of original addresses behind active[i]. Both slices
+// are used as scratch space and are not valid afterwards.
+func planSortedTree(tree TreeRef, leafCount int64, active, weights []int64) (TreePlan, error) {
+	result := TreePlan{Tree: tree, LeafCount: leafCount, Targets: append([]int64(nil), active...)}
 
 	// Walking each level's sorted active indexes emits Required already in
 	// canonical (level, index) order.
@@ -290,7 +297,7 @@ func buildRequests(trees []TreePlan) ([]SegmentRequest, []UpperRequest) {
 
 	segmentRequests := make([]SegmentRequest, 0, len(segments))
 	for key, indexes := range segments {
-		sort.Slice(indexes, func(left, right int) bool { return indexes[left] < indexes[right] })
+		slices.Sort(indexes)
 		segmentRequests = append(segmentRequests, SegmentRequest{
 			Tree: key.tree, RegionID: key.tree.RegionID, ShardID: key.tree.ShardID,
 			SegmentID: key.tree.SegmentID, Level: key.level, NodeIndexes: indexes,
@@ -305,7 +312,7 @@ func buildRequests(trees []TreePlan) ([]SegmentRequest, []UpperRequest) {
 
 	upperRequests := make([]UpperRequest, 0, len(uppers))
 	for key, indexes := range uppers {
-		sort.Slice(indexes, func(left, right int) bool { return indexes[left] < indexes[right] })
+		slices.Sort(indexes)
 		upperRequests = append(upperRequests, UpperRequest{
 			Tree: key.tree, ScopeType: key.scopeType, ScopeID: key.scopeID,
 			BucketID: key.bucketID, Level: key.level, NodeIndexes: indexes,

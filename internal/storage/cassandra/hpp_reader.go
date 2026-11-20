@@ -1,9 +1,11 @@
 package cassandra
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
@@ -283,48 +285,78 @@ func (reader *HPPReader) FetchProofNodes(ctx context.Context, plan hpp.ProofPlan
 		partitions[index].add(request.Level, request.NodeIndexes)
 	}
 
-	nodes := make(map[hpp.NodeRef][32]byte)
-	var mutex sync.Mutex
+	results := make([][]hpp.ProofNode, len(partitions))
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(reader.maxConcurrency)
-	for _, partition := range partitions {
-		partition := partition
+	for index := range partitions {
+		index := index
 		group.Go(func() error {
-			fetched, err := reader.fetchPartition(groupCtx, partition)
+			fetched, err := reader.fetchPartition(groupCtx, partitions[index])
 			if err != nil {
 				return err
 			}
-			return mergeProofNodes(&mutex, nodes, fetched)
+			results[index] = fetched
+			return nil
 		})
 	}
 	if err := group.Wait(); err != nil {
 		return nil, fmt.Errorf("fetch HPP proof nodes: %w", err)
 	}
-	result := make([]hpp.ProofNode, 0, len(nodes))
-	for ref, hash := range nodes {
-		result = append(result, hpp.ProofNode{Ref: ref, Hash: hash})
+	// Every partition holds a different tree (or bucket of one), so the partitions' nodes are
+	// disjoint; they are joined and put in canonical order here, not merged through a map. The
+	// duplicate check below keeps the old behaviour for a reader that returned a node twice.
+	total := 0
+	for _, fetched := range results {
+		total += len(fetched)
 	}
-	sort.Slice(result, func(left, right int) bool {
-		leftRef := result[left].Ref
-		rightRef := result[right].Ref
-		if leftRef.Tree.Layer != rightRef.Tree.Layer {
-			return leftRef.Tree.Layer < rightRef.Tree.Layer
-		}
-		if leftRef.Tree.RegionID != rightRef.Tree.RegionID {
-			return leftRef.Tree.RegionID < rightRef.Tree.RegionID
-		}
-		if leftRef.Tree.ShardID != rightRef.Tree.ShardID {
-			return leftRef.Tree.ShardID < rightRef.Tree.ShardID
-		}
-		if leftRef.Tree.SegmentID != rightRef.Tree.SegmentID {
-			return leftRef.Tree.SegmentID < rightRef.Tree.SegmentID
-		}
-		if leftRef.Position.Level != rightRef.Position.Level {
-			return leftRef.Position.Level < rightRef.Position.Level
-		}
-		return leftRef.Position.Index < rightRef.Position.Index
-	})
+	result := make([]hpp.ProofNode, 0, total)
+	for _, fetched := range results {
+		result = append(result, fetched...)
+	}
+	if !slices.IsSortedFunc(result, compareProofNodes) {
+		slices.SortFunc(result, compareProofNodes)
+	}
+	result, err := dropIdenticalDuplicates(result)
+	if err != nil {
+		return nil, fmt.Errorf("fetch HPP proof nodes: %w", err)
+	}
 	return result, nil
+}
+
+// compareProofNodes is the canonical node order of a proof: tree layer, region, shard, segment, level, index.
+func compareProofNodes(left, right hpp.ProofNode) int {
+	if left.Ref.Tree.Layer != right.Ref.Tree.Layer {
+		return cmp.Compare(left.Ref.Tree.Layer, right.Ref.Tree.Layer)
+	}
+	if left.Ref.Tree.RegionID != right.Ref.Tree.RegionID {
+		return strings.Compare(left.Ref.Tree.RegionID, right.Ref.Tree.RegionID)
+	}
+	if left.Ref.Tree.ShardID != right.Ref.Tree.ShardID {
+		return cmp.Compare(left.Ref.Tree.ShardID, right.Ref.Tree.ShardID)
+	}
+	if left.Ref.Tree.SegmentID != right.Ref.Tree.SegmentID {
+		return cmp.Compare(left.Ref.Tree.SegmentID, right.Ref.Tree.SegmentID)
+	}
+	if left.Ref.Position.Level != right.Ref.Position.Level {
+		return cmp.Compare(left.Ref.Position.Level, right.Ref.Position.Level)
+	}
+	return cmp.Compare(left.Ref.Position.Index, right.Ref.Position.Index)
+}
+
+// dropIdenticalDuplicates removes repeated nodes from a sorted list; two different hashes for one
+// node are an error.
+func dropIdenticalDuplicates(sorted []hpp.ProofNode) ([]hpp.ProofNode, error) {
+	kept := sorted[:0]
+	for _, node := range sorted {
+		if last := len(kept) - 1; last >= 0 && kept[last].Ref == node.Ref {
+			if kept[last].Hash != node.Hash {
+				return nil, fmt.Errorf("conflicting proof node %+v", node.Ref)
+			}
+			continue
+		}
+		kept = append(kept, node)
+	}
+	return kept, nil
 }
 
 const segmentPartitionQuery = `
@@ -356,29 +388,31 @@ type nodePartition struct {
 }
 
 func (partition *nodePartition) add(level int32, indexes []int64) {
+	partition.positions = slices.Grow(partition.positions, len(indexes))
 	for _, index := range indexes {
 		partition.positions = append(partition.positions, nodeKey{Level: level, Index: index})
 	}
 }
 
+// nodePageSize is the smallest page a partition read asks for. The driver's default of 5,000 rows
+// splits a large answer into several sequential round trips; a page as large as the request returns
+// the whole answer in one.
+const nodePageSize = 5000
+
 func (reader *HPPReader) fetchPartition(ctx context.Context, partition nodePartition) ([]hpp.ProofNode, error) {
-	arguments := append(append([]interface{}(nil), partition.keys...), partition.positions)
-	iter := reader.session.Query(partition.query, arguments...).IterContext(ctx)
+	arguments := append(append(make([]interface{}, 0, len(partition.keys)+1), partition.keys...), partition.positions)
+	iter := reader.session.Query(partition.query, arguments...).
+		PageSize(max(len(partition.positions), nodePageSize)).IterContext(ctx)
 	nodes := make([]hpp.ProofNode, 0, len(partition.positions))
-	seen := make(map[nodeKey]bool, len(partition.positions))
-	for {
-		var level int32
-		var index int64
-		var hash []byte
-		if !iter.Scan(&level, &index, &hash) {
-			break
-		}
+	var level int32
+	var index int64
+	var hash []byte // the driver refills this slice for every row, so one buffer serves them all
+	for iter.Scan(&level, &index, &hash) {
 		converted, err := proofHash(hash)
 		if err != nil {
 			_ = iter.Close()
 			return nil, err
 		}
-		seen[nodeKey{Level: level, Index: index}] = true
 		nodes = append(nodes, hpp.ProofNode{
 			Ref:  hpp.NodeRef{Tree: partition.tree, Position: hpp.NodePosition{Level: level, Index: index}},
 			Hash: converted,
@@ -387,26 +421,47 @@ func (reader *HPPReader) fetchPartition(ctx context.Context, partition nodeParti
 	if err := iter.Close(); err != nil {
 		return nil, err
 	}
-	for _, position := range partition.positions {
-		if !seen[position] {
-			return nil, fmt.Errorf("proof node missing for tree %+v at level %d index %d",
-				partition.tree, position.Level, position.Index)
-		}
+	if err := partition.checkAllPresent(nodes); err != nil {
+		return nil, err
 	}
-	reader.Stats.addRead(fmt.Sprintf("%s|%v", partition.query, partition.keys), len(partition.positions), len(nodes))
+	if reader.Stats != nil {
+		reader.Stats.addRead(fmt.Sprintf("%s|%v", partition.query, partition.keys), len(partition.positions), len(nodes))
+	}
 	return nodes, nil
 }
 
-func mergeProofNodes(mutex *sync.Mutex, destination map[hpp.NodeRef][32]byte,
-	nodes []hpp.ProofNode) error {
-
-	mutex.Lock()
-	defer mutex.Unlock()
-	for _, node := range nodes {
-		if existing, duplicate := destination[node.Ref]; duplicate && existing != node.Hash {
-			return fmt.Errorf("conflicting proof node %+v", node.Ref)
+// checkAllPresent reports the first requested position that has no returned row. Both lists are
+// walked in (level, index) order, so no lookup set is built; a repeated position needs one row.
+func (partition nodePartition) checkAllPresent(nodes []hpp.ProofNode) error {
+	less := func(a, b hpp.NodePosition) int {
+		if a.Level != b.Level {
+			return cmp.Compare(a.Level, b.Level)
 		}
-		destination[node.Ref] = node.Hash
+		return cmp.Compare(a.Index, b.Index)
+	}
+	byPosition := func(a, b hpp.ProofNode) int { return less(a.Ref.Position, b.Ref.Position) }
+	if !slices.IsSortedFunc(nodes, byPosition) {
+		nodes = slices.Clone(nodes)
+		slices.SortFunc(nodes, byPosition)
+	}
+	positions := partition.positions
+	byKey := func(a, b nodeKey) int {
+		return less(hpp.NodePosition{Level: a.Level, Index: a.Index}, hpp.NodePosition{Level: b.Level, Index: b.Index})
+	}
+	if !slices.IsSortedFunc(positions, byKey) {
+		positions = slices.Clone(positions)
+		slices.SortFunc(positions, byKey)
+	}
+	next := 0
+	for _, position := range positions {
+		want := hpp.NodePosition{Level: position.Level, Index: position.Index}
+		for next < len(nodes) && less(nodes[next].Ref.Position, want) < 0 {
+			next++
+		}
+		if next == len(nodes) || nodes[next].Ref.Position != want {
+			return fmt.Errorf("proof node missing for tree %+v at level %d index %d",
+				partition.tree, position.Level, position.Index)
+		}
 	}
 	return nil
 }
