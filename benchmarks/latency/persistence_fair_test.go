@@ -362,7 +362,9 @@ func (fixture *persistentFairHMFFixture) seedALL(ctx context.Context) error {
 	if os.Getenv("FAIR_QUERY_DIR") != "" {
 		// Native query sets: index every record under its real metadata.
 		var meta *fairNativeMetadata
+		stopLoad := fairPhase("ALL: read each record's tenant, service, log type and time")
 		meta, err = loadFairNativeMetadata(os.Getenv("FAIR_DATASET_PATH"), fixture.forest.layout.total())
+		stopLoad()
 		if err == nil {
 			tree, err = buildNativeLocatorTree(fixture.forest.layout, meta)
 		}

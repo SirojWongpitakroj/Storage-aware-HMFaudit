@@ -340,3 +340,26 @@ func TestFairALLQueryReturnsOnlyRequestedPhysicalAddresses(t *testing.T) {
 		}
 	}
 }
+
+// Bulk loading the synthetic ALL tree must build exactly the tree that one Insert per record builds.
+func TestFairSyntheticLocatorTreeBulkLoadMatchesIncrementalInserts(t *testing.T) {
+	const segmentLeaves = 8192
+	layout, err := newFairLayout([]int{2 * segmentLeaves, 2 * segmentLeaves, 2 * segmentLeaves}, 1, segmentLeaves)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(bulk bool) *locator.LocatorTree {
+		defer func(previous bool) { fairSyntheticBulkLoad = previous }(fairSyntheticBulkLoad)
+		fairSyntheticBulkLoad = bulk
+		tree, err := buildFairLocatorTree(layout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tree
+	}
+	slow, fast := build(false), build(true)
+	if slow.RootHash != fast.RootHash || slow.LeafCount != fast.LeafCount {
+		t.Fatalf("bulk-loaded tree differs: root %x vs %x, leaves %d vs %d",
+			fast.RootHash, slow.RootHash, fast.LeafCount, slow.LeafCount)
+	}
+}

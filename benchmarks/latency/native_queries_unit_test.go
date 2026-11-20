@@ -129,3 +129,132 @@ func TestFairHMFNativeQueriesRejectMissingTenant(t *testing.T) {
 		t.Fatal("a query without a tenant was accepted")
 	}
 }
+
+// A batch of several ranges (one per tenant group) is read in file order and must add up to q.
+func TestFairHMFNativeQueriesMultiRange(t *testing.T) {
+	dir := t.TempDir()
+	write := func(entry string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "R0_queries.json"), []byte(`{"queries":[`+entry+`]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	good := `{"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":5,"set":1,"record_ordinals":[1,2,3,4,5],
+	 "ranges":[
+	  {"tenant":"T1","service":"s","log_type":"INFO","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:06Z"],"returns":2},
+	  {"tenant":"T2","service":"s","log_type":"WARN","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:07Z"],"returns":3}]}`
+	write(good)
+	queries, err := fairHMFNativeQueries(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranges := queries[0].allRanges()
+	if len(queries) != 1 || len(ranges) != 2 || ranges[0].Tenant != "T1" || ranges[1].Tenant != "T2" ||
+		ranges[1].Returns != 3 || ranges[1].LogType != "WARN" || ranges[1].Region != "R0" {
+		t.Fatalf("queries = %+v", queries)
+	}
+	if bounds := ranges[1].locatorQuery(); !bounds.EndTime.Equal(ranges[1].To.Add(time.Second)) {
+		t.Fatalf("range is not closed to the second: %v", bounds.EndTime)
+	}
+	// The ranges must return exactly q logs together.
+	write(`{"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":6,"set":1,"record_ordinals":[1,2,3,4,5,6],
+	 "ranges":[{"tenant":"T1","service":"s","log_type":"INFO","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:06Z"],"returns":2},
+	           {"tenant":"T2","service":"s","log_type":"WARN","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:07Z"],"returns":3}]}`)
+	if _, err := fairHMFNativeQueries(dir); err == nil {
+		t.Fatal("ranges that do not add up to q were accepted")
+	}
+	// Every range needs a tenant.
+	write(`{"scheme":"HMF-Audit","region":"R0","shape":"clustered","q":1,"set":1,"record_ordinals":[1],
+	 "ranges":[{"tenant":"","service":"s","log_type":"INFO","time_range":["2016-01-02T03:04:05Z","2016-01-02T03:04:05Z"],"returns":1}]}`)
+	if _, err := fairHMFNativeQueries(dir); err == nil {
+		t.Fatal("a range without a tenant was accepted")
+	}
+}
+
+// Resolving a batch of ranges and joining the results gives the union of the groups' records.
+func TestNativeLocatorTreeAnswersAMultiRangeBatch(t *testing.T) {
+	layout, err := newFairLayout([]int{600, 600}, 1, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := syntheticNativeMetadata(layout.total())
+	tree, err := buildNativeLocatorTree(layout, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to := time.Unix(1_700_000_000+180, 0).UTC(), time.Unix(1_700_000_000+270, 0).UTC()
+	var parts []fairHMFRange
+	var want []int
+	for _, tenant := range []string{"T10", "T9"} {
+		count := 0
+		for ordinal := 600; ordinal < 1200; ordinal++ {
+			when := time.Unix(meta.eventTime[ordinal], 0).UTC()
+			if meta.services[meta.service[ordinal]] == "svc-a" && meta.logTypes[meta.logType[ordinal]] == "INFO" &&
+				!when.Before(from) && !when.After(to) && meta.tenants[meta.tenant[ordinal]] == tenant {
+				want = append(want, ordinal)
+				count++
+			}
+		}
+		if count == 0 {
+			t.Fatalf("tenant %q has no matching test records", tenant)
+		}
+		parts = append(parts, fairHMFRange{Region: "R1", Service: "svc-a", LogType: "INFO", Tenant: tenant,
+			From: from, To: to, Returns: count})
+	}
+	query := fairHMFNativeQuery{Q: len(want), Ranges: parts}
+	var entries []locator.LocatorEntry
+	for _, part := range query.allRanges() {
+		result, err := tree.Resolve(part.locatorQuery())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := locator.VerifyLocatorQueryResult(part.locatorQuery(), result, tree.RootHash); err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Entries) != part.Returns {
+			t.Fatalf("tenant %q: range returned %d, want %d", part.Tenant, len(result.Entries), part.Returns)
+		}
+		entries = append(entries, result.Entries...)
+	}
+	_, got, err := nativePhysicalAddresses(layout, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Ints(got)
+	sort.Ints(want)
+	if len(got) != len(want) {
+		t.Fatalf("batch has %d records, want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("record %d is ordinal %d, want %d", index, got[index], want[index])
+		}
+	}
+}
+
+// Bulk loading must build exactly the tree that one Insert per record builds; it is only faster.
+func TestNativeLocatorTreeBulkLoadMatchesIncrementalInserts(t *testing.T) {
+	layout, err := newFairLayout([]int{150_000, 150_000}, 2, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := syntheticNativeMetadata(layout.total())
+	build := func(bulk bool) (*locator.LocatorTree, time.Duration) {
+		defer func(previous bool) { fairNativeBulkLoad = previous }(fairNativeBulkLoad)
+		fairNativeBulkLoad = bulk
+		start := time.Now()
+		tree, err := buildNativeLocatorTree(layout, meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tree, time.Since(start)
+	}
+	slow, slowTime := build(false)
+	fast, fastTime := build(true)
+	if slow.RootHash != fast.RootHash || slow.LeafCount != fast.LeafCount {
+		t.Fatalf("bulk-loaded tree differs: root %x vs %x, leaves %d vs %d",
+			fast.RootHash, slow.RootHash, fast.LeafCount, slow.LeafCount)
+	}
+	t.Logf("%d records: one insert per record %v, bulk load %v (%.1fx)", layout.total(), slowTime, fastTime,
+		float64(slowTime)/float64(fastTime))
+}

@@ -99,6 +99,11 @@ func buildFairLocatorTree(layout *fairLayout) (*locator.LocatorTree, error) {
 		}
 	}
 	tree := locator.NewLocatorTree(fairLocatorOrder)
+	if fairSyntheticBulkLoad {
+		// Setup only: bulk loading builds exactly the tree of one Insert per record (same pages and
+		// root, see internal/all/locator_bulk_test.go) but hashes each page once, at the end.
+		tree.BeginBulkLoad()
+	}
 	total := layout.total()
 	for ordinal := 0; ordinal < total; ordinal++ {
 		address := layout.address(ordinal)
@@ -122,8 +127,15 @@ func buildFairLocatorTree(layout *fairLayout) (*locator.LocatorTree, error) {
 		}
 		tree.Insert(key, value, tree.RootPage)
 	}
+	if fairSyntheticBulkLoad {
+		tree.FinishBulkLoad()
+	}
 	return tree, nil
 }
+
+// fairSyntheticBulkLoad turns the bulk-load shortcut of buildFairLocatorTree on (default) or off
+// (the tests compare both).
+var fairSyntheticBulkLoad = true
 
 // persistFairLocatorTree streams the final pages in bounded batches and
 // publishes the root only after every page has been stored.
