@@ -85,6 +85,12 @@ func BenchmarkFairHMFVerificationCore(b *testing.B) {
 
 func BenchmarkFairHMFLocalizationAfterMismatch(b *testing.B) {
 	fixture := sharedFairHMFFixture(b)
+	// Native query sets: the same HMF-Audit batches as the verification experiment, one
+	// tampered record each (see runFairHMFNativeLocalization).
+	if dir := os.Getenv("FAIR_QUERY_DIR"); dir != "" {
+		runFairHMFNativeLocalization(b, fixture, dir)
+		return
+	}
 	forest := fixture.forest
 	for _, placement := range fairBenchmarkPlacements {
 		for _, batchSize := range fairHMFRequestCounts {

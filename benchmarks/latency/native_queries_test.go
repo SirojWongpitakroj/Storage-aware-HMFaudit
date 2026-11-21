@@ -491,3 +491,90 @@ func runFairHMFNativeVerification(b *testing.B, fixture *persistentFairHMFFixtur
 		})
 	}
 }
+
+// fairHMFLocalizationBatch is the audit batch of a native query in the localization
+// experiment. The records are the query's, in ascending ordinal order (EVSEB is given the
+// same list in the same order), and the tampered record is the middle one of that list,
+// index len/2. Both schemes therefore audit the same records and tamper the same one.
+func fairHMFLocalizationBatch(layout *fairLayout, ordinals []int) (batch []hpp.PhysicalAddress, tampered hpp.PhysicalAddress, err error) {
+	if len(ordinals) == 0 {
+		return nil, hpp.PhysicalAddress{}, fmt.Errorf("a localization batch needs at least one record")
+	}
+	sorted := append([]int(nil), ordinals...)
+	sort.Ints(sorted)
+	batch = make([]hpp.PhysicalAddress, 0, len(sorted))
+	for index, ordinal := range sorted {
+		if ordinal < 0 || ordinal >= layout.total() {
+			return nil, hpp.PhysicalAddress{}, fmt.Errorf("ordinal %d is outside the %d-record layout", ordinal, layout.total())
+		}
+		if index > 0 && ordinal == sorted[index-1] {
+			return nil, hpp.PhysicalAddress{}, fmt.Errorf("ordinal %d is listed twice", ordinal)
+		}
+		batch = append(batch, layout.address(ordinal))
+	}
+	return batch, batch[len(batch)/2], nil
+}
+
+// runFairHMFNativeLocalization is Experiment 2 on the native query set: for every HMF-Audit
+// query of R0_queries.json, the ALL range query is resolved and checked once (outside the
+// timer), the middle record of the result is tampered in PostgreSQL, and each timed
+// operation detects the mismatch and localizes the tampered record.
+func runFairHMFNativeLocalization(b *testing.B, fixture *persistentFairHMFFixture, dir string) {
+	queries, err := fairHMFNativeQueries(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, query := range queries {
+		b.Run(query.name(), func(b *testing.B) {
+			if _, _, err := fixture.resolveNative(ctx, query, true); err != nil {
+				b.Fatal(err)
+			}
+			addresses, tampered, err := fairHMFLocalizationBatch(fixture.forest.layout, query.Ordinals)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := fixture.setTampered(ctx, tampered); err != nil {
+				b.Fatal(err)
+			}
+			localized, err := fixture.localize(ctx, addresses)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(localized.Proof.Suspects) != 1 || localized.Proof.Suspects[0].Address == nil ||
+				*localized.Proof.Suspects[0].Address != tampered {
+				b.Fatalf("localization of %s found %+v, want the tampered record %+v",
+					query.name(), localized.Proof.Suspects, tampered)
+			}
+			warmup := fairHMFWarmupCount(b)
+			for range warmup {
+				result, err := fixture.localize(ctx, addresses)
+				if err != nil {
+					b.Fatal(err)
+				}
+				fairHMFResult = result.CalculatedReferenceRoot
+			}
+			b.ResetTimer()
+			b.ReportMetric(float64(query.Q), "records/op")
+			b.ReportMetric(1, "tampered-records/op")
+			b.ReportMetric(float64(len(localized.Proof.Rounds)), "pruning-rounds/op")
+			b.ReportMetric(float64(len(localized.Proof.Suspects)), "suspects/op")
+			b.ReportMetric(1, "postgres-batches/op")
+			b.ReportMetric(1, "cassandra-proof-builds/op")
+			b.ReportMetric(1, "cassandra-reference-leaf-fetches/op")
+			b.ReportMetric(9, "workload-version/op")
+			b.ReportMetric(float64(fixture.hppConcurrency), "hpp-concurrency/op")
+			b.ReportMetric(float64(warmup), "warmup-ops")
+			for range b.N {
+				result, err := fixture.localize(ctx, addresses)
+				if err != nil {
+					b.Fatal(err)
+				}
+				fairHMFResult = result.CalculatedReferenceRoot
+			}
+		})
+	}
+	if err := fixture.clearTamper(ctx); err != nil {
+		b.Fatal(err)
+	}
+}

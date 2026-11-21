@@ -258,3 +258,37 @@ func TestNativeLocatorTreeBulkLoadMatchesIncrementalInserts(t *testing.T) {
 	t.Logf("%d records: one insert per record %v, bulk load %v (%.1fx)", layout.total(), slowTime, fastTime,
 		float64(slowTime)/float64(fastTime))
 }
+
+func TestLocalizationBatchIsSortedAndTampersTheMiddleRecord(t *testing.T) {
+	layout, err := newFairLayout([]int{600, 600}, 1, 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ordinals come in file order (not ascending); the batch must be ascending, and the
+	// tampered record is the element at index len/2 of the ascending list.
+	batch, tampered, err := fairHMFLocalizationBatch(layout, []int{900, 5, 130, 700, 41})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{5, 41, 130, 700, 900}
+	if len(batch) != len(want) {
+		t.Fatalf("batch has %d records, want %d", len(batch), len(want))
+	}
+	for index, ordinal := range want {
+		if batch[index] != layout.address(ordinal) {
+			t.Fatalf("batch[%d] = %+v, want ordinal %d", index, batch[index], ordinal)
+		}
+	}
+	if tampered != layout.address(130) {
+		t.Fatalf("tampered = %+v, want ordinal 130 (index 2 of 5)", tampered)
+	}
+	single, only, err := fairHMFLocalizationBatch(layout, []int{777})
+	if err != nil || len(single) != 1 || only != layout.address(777) {
+		t.Fatalf("q=1 batch %+v tampered %+v err %v", single, only, err)
+	}
+	for name, ordinals := range map[string][]int{"empty": nil, "duplicate": {3, 3}, "negative": {-1}, "past the end": {1200}} {
+		if _, _, err := fairHMFLocalizationBatch(layout, ordinals); err == nil {
+			t.Fatalf("%s ordinals were accepted", name)
+		}
+	}
+}
