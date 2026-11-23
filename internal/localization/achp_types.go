@@ -1,6 +1,10 @@
 package localization
 
-import "github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
+import (
+	"time"
+
+	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
+)
 
 // Disposition is ACHP's verdict on one compared node.
 type Disposition string
@@ -87,7 +91,11 @@ type ACHPRound struct {
 	// Candidates is how many distinct joint frontiers were costed.
 	Candidates int
 	Chosen     CostEstimate
-	Expansions []Expansion
+	// PlanningTime is the wall time spent enumerating and costing candidate
+	// frontiers this round. It is observational: it takes no part in any
+	// decision and is not replayed by VerifyProof.
+	PlanningTime time.Duration
+	Expansions   []Expansion
 }
 
 // ACHPParameters records the knobs that steered the run.

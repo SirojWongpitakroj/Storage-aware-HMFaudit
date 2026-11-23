@@ -93,6 +93,9 @@ func (service *Service) localizeACHP(ctx context.Context, request Request,
 		var joint jointFrontier
 		var chosen CostEstimate
 		candidateCount := 0
+		// time.Now, not config.Now: the planning clock must not disturb the
+		// calibration clock's call sequence.
+		planningStarted := time.Now()
 		if len(tasks) > 0 {
 			candidates := generator.generate(tasks)
 			candidateCount = len(candidates)
@@ -101,6 +104,8 @@ func (service *Service) localizeACHP(ctx context.Context, request Request,
 				return Result{}, fallbackf("no candidate frontier for %d suspect branches", len(tasks))
 			}
 		}
+
+		planningTime := time.Since(planningStarted)
 
 		expansions := make([]Expansion, 0, len(joint.plans)+len(probes))
 		fetchRefs := make([][]hpp.NodeRef, 0, cap(expansions))
@@ -168,7 +173,8 @@ func (service *Service) localizeACHP(ctx context.Context, request Request,
 			estimator.observeRetrieval(model.retrievalAtUnitScale(joint), observed)
 		}
 		transcript.Rounds = append(transcript.Rounds, ACHPRound{
-			Index: round, Candidates: candidateCount, Chosen: chosen, Expansions: expansions,
+			Index: round, Candidates: candidateCount, Chosen: chosen, PlanningTime: planningTime,
+			Expansions: expansions,
 		})
 		tasks = next
 	}
