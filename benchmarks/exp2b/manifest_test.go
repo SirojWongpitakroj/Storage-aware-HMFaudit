@@ -35,7 +35,7 @@ func TestDefaultParamsAreTheSpecification(t *testing.T) {
 	if err := p.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if p.Q != 4096 || p.QueryCount != 5 || p.Warmups != 3 || p.Repetitions != 20 ||
+	if p.Q != 1024 || p.QueryCount != 5 || p.Warmups != 3 || p.Repetitions != 20 ||
 		!slices.Equal(p.CorruptionCounts, []int{1, 4, 16, 64}) {
 		t.Fatalf("defaults drifted from the specification: %+v", p)
 	}
@@ -63,7 +63,6 @@ func TestParamsRejectWhatCannotBeBuilt(t *testing.T) {
 func TestQueriesAreExactDistinctAndReproducible(t *testing.T) {
 	layout := testLayout(t, 4, 160, 512)
 	params := DefaultParams()
-	params.DensePerSegment = 256
 	first, err := GenerateQueries(params, layout)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +77,7 @@ func TestQueriesAreExactDistinctAndReproducible(t *testing.T) {
 		t.Fatal("the same parameters produced different queries")
 	}
 	for _, query := range first.Queries {
-		if len(query.Ordinals) != 4096 {
+		if len(query.Ordinals) != 1024 {
 			t.Fatalf("%s has %d records", query.ID, len(query.Ordinals))
 		}
 		seen := map[int]bool{}
@@ -103,11 +102,11 @@ func TestQueriesAreExactDistinctAndReproducible(t *testing.T) {
 }
 
 func TestQueriesFailWhenTheLayoutIsTooSmall(t *testing.T) {
-	small := testLayout(t, 1, 100, 512) // 100 segments < 136
+	small := testLayout(t, 1, 60, 512) // 60 segments < 68
 	if _, err := GenerateQueries(DefaultParams(), small); err == nil {
 		t.Fatal("a layout with too few segments was accepted")
 	}
-	narrow := testLayout(t, 4, 160, 128) // segments too short for a 256-record run
+	narrow := testLayout(t, 4, 160, 64) // segments too short for a 128-record run
 	if _, err := GenerateQueries(DefaultParams(), narrow); err == nil {
 		t.Fatal("a layout with segments shorter than the dense run was accepted")
 	}

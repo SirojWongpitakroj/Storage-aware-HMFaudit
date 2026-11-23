@@ -58,15 +58,15 @@ type Params struct {
 	Repetitions      int   `json:"repetitions"`
 }
 
-// DefaultParams is the Experiment 2B specification: five fixed queries of 4,096
+// DefaultParams is the Experiment 2B specification: five fixed queries of 1,024
 // records, m in {1, 4, 16, 64}, three warm-ups and twenty measured repetitions.
-// Each query has 8 dense segments x 256 records and 128 sparse segments x 16
-// records, so m = 64 can be clustered (256 >= 64 in one segment) and scattered
-// (136 >= 64 distinct segments).
+// Each query has 4 dense segments x 128 records and 64 sparse segments x 8
+// records, so m = 64 can be clustered (128 >= 64 in one segment) and scattered
+// (68 >= 64 distinct segments, one record each).
 func DefaultParams() Params {
 	return Params{
-		MasterSeed: 20261123, QueryCount: 5, Q: 4096,
-		DenseSegments: 8, DensePerSegment: 256, SparsePerSegment: 16,
+		MasterSeed: 20261123, QueryCount: 5, Q: 1024,
+		DenseSegments: 4, DensePerSegment: 128, SparsePerSegment: 8,
 		CorruptionCounts: []int{1, 4, 16, 64}, Warmups: 3, Repetitions: 20,
 	}
 }

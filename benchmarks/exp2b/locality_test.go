@@ -8,13 +8,12 @@ import (
 	"testing"
 )
 
-// defaultScale draws the real specification (q = 4096, m up to 64) over a layout
+// defaultScale draws the real specification (q = 1024, m up to 64) over a layout
 // with room for it, so the locality properties are checked at the real size.
 func defaultScale(t testing.TB) (QueryManifest, CorruptionManifest, *Layout) {
 	t.Helper()
 	layout := testLayout(t, 4, 160, 512)
 	params := DefaultParams()
-	params.DensePerSegment = 256
 	params.QueryCount = 2
 	params.Warmups, params.Repetitions = 3, 20
 	queries, err := GenerateQueries(params, layout)
@@ -207,7 +206,7 @@ func TestEveryRepetitionIsADistinctSeededDraw(t *testing.T) {
 	// A different master seed gives different corruption on the same queries' layout.
 	layout := testLayout(t, 4, 160, 512)
 	params := DefaultParams()
-	params.DensePerSegment, params.QueryCount = 256, 2
+	params.QueryCount = 2
 	params.MasterSeed++
 	queries, _ := GenerateQueries(params, layout)
 	other, err := GenerateCorruption(queries, layout)
@@ -277,13 +276,13 @@ func TestQueryLocalityAndCorruptionLocalityAreSeparateFields(t *testing.T) {
 		}
 	}
 	query := queries.Queries[0]
-	if query.SegmentCount != 136 || query.MaxRecordsInSegment != 256 || len(query.Suitability) != 3 {
+	if query.SegmentCount != 68 || query.MaxRecordsInSegment != 128 || len(query.Suitability) != 3 {
 		t.Fatalf("query locality metadata: %+v", query)
 	}
 	for _, fit := range query.Suitability {
-		// 8 dense segments hold 256 records, 128 sparse ones hold 16: m = 4 and 16 fit
-		// everywhere, m = 64 only in the dense segments.
-		wantEligible := map[int]int{4: 136, 16: 136, 64: 8}[fit.Count]
+		// 4 dense segments hold 128 records, 64 sparse ones hold 8: m = 4 fits everywhere,
+		// m = 16 and 64 only in the dense segments.
+		wantEligible := map[int]int{4: 68, 16: 4, 64: 4}[fit.Count]
 		if fit.ClusteredEligibleSegments != wantEligible || fit.ScatteredSegments != fit.Count {
 			t.Fatalf("suitability %+v", fit)
 		}
@@ -387,7 +386,7 @@ func TestScatteredBelowMaximumSpreadAndClusteredAcrossSegmentsAreRejected(t *tes
 
 func TestUnsuitableQueryIsFlaggedNotWeakened(t *testing.T) {
 	params := DefaultParams()
-	params.CorruptionCounts = []int{1, 300} // a dense segment holds only 256
+	params.CorruptionCounts = []int{1, 300} // a dense segment holds only 128
 	if err := params.Validate(); err == nil || !strings.Contains(err.Error(), "unsuitable") {
 		t.Fatalf("m larger than any segment's requested records: %v", err)
 	}
@@ -400,7 +399,7 @@ func TestUnsuitableQueryIsFlaggedNotWeakened(t *testing.T) {
 }
 
 func TestExistingQueriesSatisfyBothLocalities(t *testing.T) {
-	// The default query shape (8 dense segments of 256, 128 sparse of 16) supports
+	// The default query shape (4 dense segments of 128, 64 sparse of 8) supports
 	// every m in {4, 16, 64} both clustered and scattered, so the queries are reused
 	// unchanged: only their metadata is new.
 	queries, _, _ := defaultScale(t)

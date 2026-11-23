@@ -17,7 +17,7 @@ import (
 )
 
 // Experiment 2B: ACHP versus fixed-depth localization under increasing corruption
-// density (m = 1, 4, 16, 64 of q = 4096 audited records), clustered and scattered.
+// density (m = 1, 4, 16, 64 of q = 1024 audited records), clustered and scattered.
 //
 //	FAIR_EXP2B_DRY_RUN=1 FAIR_EXP2B_OUT=<dir> go test ./benchmarks/latency -run '^TestExp2BDryRun$' -v
 //	    manifests at full scale plus an in-memory smoke run; no database, no cloud.
