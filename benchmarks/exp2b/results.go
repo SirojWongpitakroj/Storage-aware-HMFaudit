@@ -26,12 +26,23 @@ type RawRow struct {
 	RequestedStrategy string
 	ExecutedStrategy  string
 	QueryID           string
+	// QueryLocality describes the audited batch; Locality is the corruption
+	// locality of this case (common for m = 1). They are different concepts.
+	QueryLocality     string
+	QuerySegments     int
 	CorruptionCount   int
-	Pattern           string
+	Locality          string
+	ActualLocality    string
 	Repetition        int
 	Seed              uint64
 	CorruptedOrdinals []int
-	DistinctSegments  int
+	// CorruptedAddresses are the corrupted records' HMF addresses.
+	CorruptedAddresses string
+	DistinctSegments   int
+	DistinctShards     int
+	DistinctRegions    int
+	// RecordsPerSegment is "region/shard/segment:records;...".
+	RecordsPerSegment string
 
 	LatencyMS float64
 
@@ -62,8 +73,10 @@ type RawRow struct {
 
 // RawHeader is raw.csv's header row.
 var RawHeader = []string{
-	"algorithm", "requested_strategy", "executed_strategy", "query_id", "corruption_count", "pattern",
-	"repetition", "seed", "corrupted_ordinals", "distinct_segments", "latency_ms",
+	"algorithm", "requested_strategy", "executed_strategy", "query_id", "query_locality", "query_segments",
+	"corruption_count", "corruption_locality", "actual_corruption_locality", "repetition", "seed",
+	"corrupted_ordinals", "corrupted_addresses", "distinct_segments", "distinct_shards", "distinct_regions",
+	"records_per_segment", "latency_ms",
 	"partition_reads", "distinct_partitions", "cassandra_reads_observed", "metadata_reads",
 	"retrieval_rounds", "pruning_rounds", "nodes_retrieved", "evidence_bytes", "retrieval_ms",
 	"planning_ms", "suspect_branches", "confirmed_leaves", "fallback", "fallback_reason",
@@ -95,9 +108,11 @@ func (row RawRow) Fields() []string {
 	}
 	return []string{
 		row.Algorithm, row.RequestedStrategy, row.ExecutedStrategy, row.QueryID,
-		strconv.Itoa(row.CorruptionCount), row.Pattern, strconv.Itoa(row.Repetition),
-		strconv.FormatUint(row.Seed, 10), strings.Join(ordinals, ";"), strconv.Itoa(row.DistinctSegments),
-		latency, strconv.Itoa(row.PartitionReads), strconv.Itoa(row.DistinctPartitions), cassandra,
+		row.QueryLocality, strconv.Itoa(row.QuerySegments),
+		strconv.Itoa(row.CorruptionCount), row.Locality, row.ActualLocality, strconv.Itoa(row.Repetition),
+		strconv.FormatUint(row.Seed, 10), strings.Join(ordinals, ";"), row.CorruptedAddresses,
+		strconv.Itoa(row.DistinctSegments), strconv.Itoa(row.DistinctShards), strconv.Itoa(row.DistinctRegions),
+		row.RecordsPerSegment, latency, strconv.Itoa(row.PartitionReads), strconv.Itoa(row.DistinctPartitions), cassandra,
 		strconv.Itoa(row.MetadataReads), strconv.Itoa(row.RetrievalRounds), strconv.Itoa(row.PruningRounds),
 		strconv.Itoa(row.NodesRetrieved), strconv.FormatInt(row.EvidenceBytes, 10),
 		optional(row.RetrievalMS), optional(row.PlanningMS), strconv.Itoa(row.SuspectBranches),
@@ -145,22 +160,40 @@ func Percentile(values []float64, p float64) float64 {
 
 // SummaryHeader is summary.csv's header row.
 var SummaryHeader = []string{
-	"algorithm", "corruption_count", "pattern", "attempted", "valid", "error_count", "incorrect_count",
-	"unverified_count", "fallback_count", "unresolved_count", "false_positive_total", "missed_total",
-	"p50_latency_ms", "p95_latency_ms", "mean_partition_reads", "mean_distinct_partitions",
-	"mean_retrieval_rounds", "mean_pruning_rounds", "mean_nodes_retrieved", "mean_evidence_bytes",
-	"mean_retrieval_ms", "mean_planning_ms", "mean_suspect_branches", "mean_confirmed_leaves",
+	"algorithm", "corruption_count", "corruption_locality", "query_locality", "actual_corruption_locality",
+	"queries", "attempted", "valid", "error_count", "incorrect_count", "unverified_count", "fallback_count",
+	"unresolved_count", "false_positive_total", "missed_total", "p50_latency_ms", "p95_latency_ms",
+	"mean_partition_reads", "mean_distinct_partitions", "mean_retrieval_rounds", "mean_pruning_rounds",
+	"mean_nodes_retrieved", "mean_evidence_bytes", "mean_retrieval_ms", "mean_planning_ms",
+	"mean_suspect_branches", "mean_confirmed_leaves", "mean_distinct_segments", "mean_distinct_shards",
+	"mean_distinct_regions",
 }
 
 type summaryKey struct {
 	algorithm string
 	count     int
-	pattern   string
+	locality  string
 }
 
 type accumulator struct {
 	attempted, valid, errors, incorrect, unverified, fallbacks, unresolved, falsePositives, missed      int
 	latency, partitions, distinct, rounds, pruning, nodes, bytes, retrieval, planning, suspects, leaves []float64
+	// Workload description, over every attempted row: it says what was run, not what was measured.
+	segments, shards, regions []float64
+	queries                   map[string]struct{}
+	queryLocalities, actual   map[string]struct{}
+}
+
+func single(values map[string]struct{}) string {
+	switch len(values) {
+	case 0:
+		return ""
+	case 1:
+		for value := range values {
+			return value
+		}
+	}
+	return "mixed"
 }
 
 func mean(values []float64) string {
@@ -181,7 +214,9 @@ func quantile(values []float64, p float64) string {
 	return strconv.FormatFloat(Percentile(values, p), 'f', 6, 64)
 }
 
-// Summarize groups rows by algorithm, corruption count and pattern. Latency
+// Summarize groups rows by corruption count, corruption locality and algorithm.
+// m = 1 has only the common locality, so its measurements are counted once, never
+// once per locality. Latency
 // percentiles and the mean I/O, transfer, round and planning figures use only
 // valid rows: a correct, verified localization by the strategy that was asked
 // for. Errors, fallbacks, incorrect and unverified runs are counted separately
@@ -191,14 +226,20 @@ func Summarize(rows []RawRow) [][]string {
 	groups := map[summaryKey]*accumulator{}
 	var keys []summaryKey
 	for _, row := range rows {
-		key := summaryKey{row.Algorithm, row.CorruptionCount, row.Pattern}
+		key := summaryKey{row.Algorithm, row.CorruptionCount, row.Locality}
 		acc, ok := groups[key]
 		if !ok {
-			acc = &accumulator{}
+			acc = &accumulator{queries: map[string]struct{}{}, queryLocalities: map[string]struct{}{}, actual: map[string]struct{}{}}
 			groups[key] = acc
 			keys = append(keys, key)
 		}
 		acc.attempted++
+		acc.queries[row.QueryID] = struct{}{}
+		acc.queryLocalities[row.QueryLocality] = struct{}{}
+		acc.actual[row.ActualLocality] = struct{}{}
+		acc.segments = append(acc.segments, float64(row.DistinctSegments))
+		acc.shards = append(acc.shards, float64(row.DistinctShards))
+		acc.regions = append(acc.regions, float64(row.DistinctRegions))
 		acc.unresolved += row.Unresolved
 		acc.falsePositives += row.FalsePositives
 		acc.missed += row.Missed
@@ -233,8 +274,8 @@ func Summarize(rows []RawRow) [][]string {
 		if a.count != b.count {
 			return a.count < b.count
 		}
-		if a.pattern != b.pattern {
-			return a.pattern < b.pattern
+		if a.locality != b.locality {
+			return a.locality < b.locality
 		}
 		return a.algorithm < b.algorithm
 	})
@@ -242,12 +283,14 @@ func Summarize(rows []RawRow) [][]string {
 	for _, key := range keys {
 		acc := groups[key]
 		table = append(table, []string{
-			key.algorithm, strconv.Itoa(key.count), key.pattern, strconv.Itoa(acc.attempted), strconv.Itoa(acc.valid),
+			key.algorithm, strconv.Itoa(key.count), key.locality, single(acc.queryLocalities), single(acc.actual),
+			strconv.Itoa(len(acc.queries)), strconv.Itoa(acc.attempted), strconv.Itoa(acc.valid),
 			strconv.Itoa(acc.errors), strconv.Itoa(acc.incorrect), strconv.Itoa(acc.unverified),
 			strconv.Itoa(acc.fallbacks), strconv.Itoa(acc.unresolved), strconv.Itoa(acc.falsePositives),
 			strconv.Itoa(acc.missed), quantile(acc.latency, 50), quantile(acc.latency, 95),
 			mean(acc.partitions), mean(acc.distinct), mean(acc.rounds), mean(acc.pruning), mean(acc.nodes),
 			mean(acc.bytes), mean(acc.retrieval), mean(acc.planning), mean(acc.suspects), mean(acc.leaves),
+			mean(acc.segments), mean(acc.shards), mean(acc.regions),
 		})
 	}
 	return table

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/SirojWongpitakroj/hmf-audit/internal/hpp"
@@ -63,7 +64,7 @@ func (c Config) progress(format string, args ...any) {
 }
 
 // Run executes every case of the manifests: for each query, corruption count
-// and pattern, the warm-up cases and then the measured ones. For every case the
+// and locality, the warm-up cases and then the measured ones. For every case the
 // records are corrupted once, the auditor's failed proof is built once, and each
 // algorithm then localizes it, so all algorithms see exactly the same corruption
 // and evidence. The algorithm order rotates from case to case.
@@ -84,8 +85,8 @@ func Run(ctx context.Context, queries QueryManifest, corruption CorruptionManife
 			return rows, fmt.Errorf("exp2b: %s: %w", query.ID, err)
 		}
 		for _, count := range queries.Params.CorruptionCounts {
-			for _, pattern := range Patterns(count) {
-				for _, c := range corruption.CasesFor(query.ID, count, pattern) {
+			for _, locality := range Localities(count) {
+				for _, c := range corruption.CasesFor(query.ID, count, locality) {
 					caseRows, err := runCase(ctx, env, cfg, batch, c, caseNumber)
 					caseNumber++
 					if err != nil {
@@ -103,7 +104,7 @@ func Run(ctx context.Context, queries QueryManifest, corruption CorruptionManife
 						}
 					}
 				}
-				cfg.progress("%s m=%d %s done (%d rows so far)", query.ID, count, pattern, len(rows))
+				cfg.progress("%s m=%d %s done (%d rows so far)", query.ID, count, locality, len(rows))
 			}
 		}
 	}
@@ -118,11 +119,11 @@ func runCase(ctx context.Context, env Environment, cfg Config, batch []hpp.Physi
 	}
 	if err := env.Inject(ctx, c.Ordinals()); err != nil {
 		_ = env.Restore(ctx)
-		return nil, fmt.Errorf("exp2b: inject %s m=%d %s #%d: %w", c.QueryID, c.Count, c.Pattern, c.Repetition, err)
+		return nil, fmt.Errorf("exp2b: inject %s m=%d %s #%d: %w", c.QueryID, c.Count, c.Locality, c.Repetition, err)
 	}
 	defer func() {
 		if restoreErr := env.Restore(ctx); restoreErr != nil && err == nil {
-			err = fmt.Errorf("exp2b: restore after %s m=%d %s #%d: %w", c.QueryID, c.Count, c.Pattern, c.Repetition, restoreErr)
+			err = fmt.Errorf("exp2b: restore after %s m=%d %s #%d: %w", c.QueryID, c.Count, c.Locality, c.Repetition, restoreErr)
 		}
 	}()
 	proof, auditorRoot, err := env.FailedProof(ctx, batch)
@@ -153,9 +154,22 @@ func measure(ctx context.Context, alg Algorithm, verify bool, batch []hpp.Physic
 	failed hpp.HMFProof, auditorRoot, trusted [32]byte, expected map[hpp.PhysicalAddress]struct{}, c Case) RawRow {
 	row := RawRow{
 		Algorithm: alg.Name, RequestedStrategy: strategyName(alg.Requested), QueryID: c.QueryID,
-		CorruptionCount: c.Count, Pattern: c.Pattern, Repetition: c.Repetition, Seed: c.Seed,
-		CorruptedOrdinals: c.Ordinals(), DistinctSegments: c.DistinctSegments, PlanningMS: -1, CassandraReads: -1,
+		QueryLocality: c.QueryLocality, QuerySegments: c.QuerySegments,
+		CorruptionCount: c.Count, Locality: c.Locality, ActualLocality: c.ActualLocality,
+		Repetition: c.Repetition, Seed: c.Seed, CorruptedOrdinals: c.Ordinals(),
+		DistinctSegments: c.DistinctSegments, DistinctShards: c.DistinctShards, DistinctRegions: c.DistinctRegions,
+		PlanningMS: -1, CassandraReads: -1,
 	}
+	addresses := make([]string, len(c.Records))
+	for index, record := range c.Records {
+		addresses[index] = record.Address
+	}
+	row.CorruptedAddresses = strings.Join(addresses, ";")
+	perSegment := make([]string, len(c.RecordsPerSegment))
+	for index, per := range c.RecordsPerSegment {
+		perSegment[index] = fmt.Sprintf("%s/S%d/G%d:%d", per.Region, per.Shard, per.Segment, per.Records)
+	}
+	row.RecordsPerSegment = strings.Join(perSegment, ";")
 	request := localization.Request{
 		Addresses: slices.Clone(batch), AuditorGlobalRoot: auditorRoot, FailedProof: failed,
 		AnchoredGlobalRoot: trusted, K: alg.K, Strategy: alg.Requested,

@@ -71,7 +71,7 @@ func runInMemoryExp2B(t *testing.T, params exp2b.Params, wrap func(*memoryExp2BE
 func TestExp2BInMemoryEndToEnd(t *testing.T) {
 	params := smallExp2BParams(2)
 	rows, _, _ := runInMemoryExp2B(t, params, nil)
-	// 2 queries x (m=1 common + m=4 and m=16, two patterns each) x 2 measured x 2 algorithms.
+	// 2 queries x (m=1 common + m=4 and m=16, two localities each) x 2 measured x 2 algorithms.
 	if want := 2 * (1 + 2*2) * 2 * 2; len(rows) != want {
 		t.Fatalf("%d measured rows, want %d (warm-ups must not be recorded)", len(rows), want)
 	}
@@ -80,13 +80,27 @@ func TestExp2BInMemoryEndToEnd(t *testing.T) {
 		byAlgorithm[row.Algorithm]++
 		if row.Status != exp2b.StatusOK {
 			t.Fatalf("%s %s m=%d %s: status %s (%s), correct=%v fp=%d missed=%d nonleaf=%d unresolved=%d fallback=%q",
-				row.Algorithm, row.QueryID, row.CorruptionCount, row.Pattern, row.Status, row.Error,
+				row.Algorithm, row.QueryID, row.CorruptionCount, row.Locality, row.Status, row.Error,
 				row.Correct, row.FalsePositives, row.Missed, row.NonLeaf, row.Unresolved, row.FallbackReason)
+		}
+		if row.QueryLocality == "" || row.ActualLocality == "" || row.CorruptedAddresses == "" || row.RecordsPerSegment == "" {
+			t.Fatalf("%s row lacks locality metadata: %+v", row.Algorithm, row)
+		}
+		switch row.Locality {
+		case exp2b.LocalityClustered:
+			if row.DistinctSegments != 1 || row.DistinctShards != 1 || row.DistinctRegions != 1 {
+				t.Fatalf("clustered row spans %d segments", row.DistinctSegments)
+			}
+		case exp2b.LocalityScattered:
+			if row.DistinctSegments != row.CorruptionCount {
+				t.Fatalf("scattered row m=%d spans %d segments", row.CorruptionCount, row.DistinctSegments)
+			}
 		}
 		if row.ConfirmedLeaves != row.CorruptionCount {
 			t.Fatalf("%s confirmed %d of %d corrupted leaves", row.Algorithm, row.ConfirmedLeaves, row.CorruptionCount)
 		}
-		if row.LatencyMS <= 0 || row.PartitionReads <= 0 || row.NodesRetrieved <= 0 || row.EvidenceBytes != int64(row.NodesRetrieved)*32 {
+		// A latency of 0 is possible on Windows, whose clock ticks coarsely; the cloud runner's is finer.
+		if row.LatencyMS < 0 || row.PartitionReads <= 0 || row.NodesRetrieved <= 0 || row.EvidenceBytes != int64(row.NodesRetrieved)*32 {
 			t.Fatalf("%s row has implausible counters: %+v", row.Algorithm, row)
 		}
 		switch row.Algorithm {
@@ -111,14 +125,14 @@ func TestExp2BInMemoryEndToEnd(t *testing.T) {
 func TestExp2BEveryAlgorithmGetsTheSameCorruption(t *testing.T) {
 	rows, _, _ := runInMemoryExp2B(t, smallExp2BParams(1), nil)
 	type key struct {
-		query   string
-		count   int
-		pattern string
-		rep     int
+		query    string
+		count    int
+		locality string
+		rep      int
 	}
 	seen := map[key]map[string]string{}
 	for _, row := range rows {
-		k := key{row.QueryID, row.CorruptionCount, row.Pattern, row.Repetition}
+		k := key{row.QueryID, row.CorruptionCount, row.Locality, row.Repetition}
 		if seen[k] == nil {
 			seen[k] = map[string]string{}
 		}

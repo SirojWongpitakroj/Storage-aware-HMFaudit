@@ -14,23 +14,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
 	"slices"
 	"sort"
 )
 
-// Corruption patterns. m = 1 has no meaningful distribution, so it uses one
-// common case shared by every algorithm.
 const (
-	PatternCommon    = "common"
-	PatternClustered = "clustered"
-	PatternScattered = "scattered"
-
 	PhaseWarmup   = "warmup"
 	PhaseMeasured = "measured"
 
 	// ManifestVersion changes when the manifest generation rules change, so a
 	// stale manifest is never reused under new rules.
-	ManifestVersion = 1
+	ManifestVersion = 2
 )
 
 // SegmentSpan is one HMF Segment: a run of Leaves consecutive dataset ordinals
@@ -119,11 +114,8 @@ func (p Params) Validate() error {
 		}
 	}
 	if p.MaxCount() > p.DensePerSegment {
-		return fmt.Errorf("exp2b: m = %d cannot be clustered: a dense segment holds %d requested records",
+		return fmt.Errorf("exp2b: query manifest unsuitable: m = %d cannot be clustered, a dense segment holds only %d requested records",
 			p.MaxCount(), p.DensePerSegment)
-	}
-	if segments := p.DenseSegments + p.SparseSegments(); p.MaxCount() > segments {
-		return fmt.Errorf("exp2b: m = %d cannot be scattered: a query spans only %d segments", p.MaxCount(), segments)
 	}
 	return nil
 }
@@ -135,6 +127,8 @@ type Record struct {
 	Shard   int64  `json:"shard"`
 	Segment int64  `json:"segment"`
 	Leaf    int    `json:"leaf"`
+	// Address is the record's HMF address, region/shard/segment/leaf.
+	Address string `json:"hmf_address"`
 }
 
 // QuerySegment summarises one segment of a query.
@@ -146,12 +140,36 @@ type QuerySegment struct {
 	Records int    `json:"records"`
 }
 
+// QueryLocalityMixed describes the queries this experiment draws: a few dense
+// segments (many requested records each) and many sparse ones. It is a property of
+// the audited batch; corruption locality is a separate property of each corruption
+// case.
+const QueryLocalityMixed = "dense+sparse"
+
+// Suitability says what a query can support for one corruption count m > 1.
+type Suitability struct {
+	Count int `json:"count"`
+	// ClusteredEligibleSegments is how many of the query's segments hold at
+	// least m requested records. Clustered corruption needs at least one.
+	ClusteredEligibleSegments int `json:"clustered_eligible_segments"`
+	// ScatteredSegments is the widest spread the query allows: min(m, segments touched).
+	ScatteredSegments int `json:"scattered_segments"`
+}
+
 // Query is one fixed audit batch: exactly Q distinct dataset ordinals, ascending.
 type Query struct {
 	ID       string         `json:"id"`
 	Seed     uint64         `json:"seed"`
 	Ordinals []int          `json:"ordinals"`
 	Segments []QuerySegment `json:"segments"`
+	// Query locality: how the audited records are laid out, independent of
+	// which of them are later corrupted.
+	QueryLocality       string        `json:"query_locality"`
+	SegmentCount        int           `json:"segment_count"`
+	ShardCount          int           `json:"shard_count"`
+	RegionCount         int           `json:"region_count"`
+	MaxRecordsInSegment int           `json:"max_records_in_segment"`
+	Suitability         []Suitability `json:"suitability"`
 }
 
 // QueryManifest is queries.json.
@@ -210,7 +228,8 @@ func (layout *Layout) Record(ordinal int) (Record, error) {
 		return Record{}, fmt.Errorf("exp2b: ordinal %d is outside the %d-record layout", ordinal, layout.total)
 	}
 	span := layout.spans[segment]
-	return Record{Ordinal: ordinal, Region: span.Region, Shard: span.Shard, Segment: span.Segment, Leaf: leaf}, nil
+	return Record{Ordinal: ordinal, Region: span.Region, Shard: span.Shard, Segment: span.Segment, Leaf: leaf,
+		Address: fmt.Sprintf("%s/S%d/G%d/L%d", span.Region, span.Shard, span.Segment, leaf)}, nil
 }
 
 // DeriveSeed is the deterministic per-case seed: a hash of the master seed and
@@ -293,6 +312,7 @@ func GenerateQueries(params Params, layout *Layout) (QueryManifest, error) {
 				Region: span.Region, Shard: span.Shard, Segment: span.Segment, Kind: p.kind, Records: len(offsets),
 			})
 		}
+		layout.annotate(&query, params.CorruptionCounts)
 		manifest.Queries = append(manifest.Queries, query)
 	}
 	if err := ValidateQueries(manifest, layout); err != nil {
@@ -367,6 +387,20 @@ func ValidateQueries(manifest QueryManifest, layout *Layout) error {
 			return fmt.Errorf("exp2b: query %s has %d dense and %d sparse segments, want %d and %d",
 				query.ID, dense, sparse, params.DenseSegments, params.SparseSegments())
 		}
+		expected := query
+		expected.QueryLocality, expected.Suitability = "", nil
+		layout.annotate(&expected, params.CorruptionCounts)
+		if !reflect.DeepEqual(expected.Suitability, query.Suitability) || expected.QueryLocality != query.QueryLocality ||
+			expected.SegmentCount != query.SegmentCount || expected.ShardCount != query.ShardCount ||
+			expected.RegionCount != query.RegionCount || expected.MaxRecordsInSegment != query.MaxRecordsInSegment {
+			return fmt.Errorf("exp2b: query %s locality metadata does not match its records", query.ID)
+		}
+		for _, fit := range query.Suitability {
+			if fit.ClusteredEligibleSegments == 0 {
+				return &UnsuitableQueryError{QueryID: query.ID, Count: fit.Count,
+					Reason: "no segment holds that many requested records, so clustered corruption cannot be drawn"}
+			}
+		}
 	}
 	return nil
 }
@@ -387,4 +421,36 @@ func (manifest QueryManifest) Query(id string) (Query, bool) {
 		}
 	}
 	return Query{}, false
+}
+
+// annotate fills the query's locality description and its suitability for each
+// corruption count m > 1.
+func (layout *Layout) annotate(query *Query, counts []int) {
+	groups := groupBySegment(*query, layout)
+	shards, regions := map[string]struct{}{}, map[string]struct{}{}
+	query.QueryLocality = QueryLocalityMixed
+	query.SegmentCount = len(groups)
+	query.MaxRecordsInSegment = 0
+	for _, group := range groups {
+		span := layout.spans[group.segment]
+		shards[fmt.Sprintf("%s/%d", span.Region, span.Shard)] = struct{}{}
+		regions[span.Region] = struct{}{}
+		query.MaxRecordsInSegment = max(query.MaxRecordsInSegment, len(group.ordinals))
+	}
+	query.ShardCount, query.RegionCount = len(shards), len(regions)
+	query.Suitability = nil
+	for _, count := range counts {
+		if count <= 1 {
+			continue
+		}
+		eligible := 0
+		for _, group := range groups {
+			if len(group.ordinals) >= count {
+				eligible++
+			}
+		}
+		query.Suitability = append(query.Suitability, Suitability{
+			Count: count, ClusteredEligibleSegments: eligible, ScatteredSegments: min(count, len(groups)),
+		})
+	}
 }

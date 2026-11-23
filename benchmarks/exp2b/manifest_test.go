@@ -47,7 +47,6 @@ func TestDefaultParamsAreTheSpecification(t *testing.T) {
 func TestParamsRejectWhatCannotBeBuilt(t *testing.T) {
 	for name, mutate := range map[string]func(*Params){
 		"m larger than a dense segment": func(p *Params) { p.CorruptionCounts = []int{1, 300} },
-		"m larger than the segments":    func(p *Params) { p.CorruptionCounts = []int{1, 200}; p.DensePerSegment = 256 },
 		"sparse not a multiple":         func(p *Params) { p.SparsePerSegment = 15 },
 		"descending counts":             func(p *Params) { p.CorruptionCounts = []int{4, 1} },
 		"no repetitions":                func(p *Params) { p.Repetitions = 0 },
@@ -142,24 +141,24 @@ func TestCorruptionIsReproducibleAndMeetsEachPattern(t *testing.T) {
 	if !bytes.Equal(a, b) {
 		t.Fatal("the same manifests produced different corruption")
 	}
-	// 5 queries... here QueryCount stays 5: queries x (1 common + 2 patterns x 2 counts) x (2+5).
+	// 5 queries... here QueryCount stays 5: queries x (1 common + 2 localities x 2 counts) x (2+5).
 	wantCases := params.QueryCount * (1 + 2*2) * (params.Warmups + params.Repetitions)
 	if len(first.Cases) != wantCases {
 		t.Fatalf("%d cases, want %d", len(first.Cases), wantCases)
 	}
 	for _, c := range first.Cases {
-		switch c.Pattern {
-		case PatternClustered:
+		switch c.Locality {
+		case LocalityClustered:
 			if c.DistinctSegments != 1 {
 				t.Fatalf("clustered case spans %d segments", c.DistinctSegments)
 			}
-		case PatternScattered:
+		case LocalityScattered:
 			if c.DistinctSegments != c.Count {
 				t.Fatalf("scattered m=%d covers %d segments", c.Count, c.DistinctSegments)
 			}
-		case PatternCommon:
+		case LocalityCommon:
 			if c.Count != 1 {
-				t.Fatal("common pattern with m != 1")
+				t.Fatal("common locality with m != 1")
 			}
 		}
 	}
@@ -176,7 +175,7 @@ func TestScatteredSpreadsAcrossThePhysicalRange(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, c := range manifest.Cases {
-		if c.Pattern != PatternScattered || c.Count != 16 {
+		if c.Locality != LocalityScattered || c.Count != 16 {
 			continue
 		}
 		// Strata of the query's segments in physical order: the i-th corrupted
@@ -211,7 +210,7 @@ func TestCorruptionSetsAreDistinctWithinAGroup(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for _, c := range manifest.Cases {
-		key := fmt.Sprint(c.QueryID, c.Count, c.Pattern, c.Ordinals())
+		key := fmt.Sprint(c.QueryID, c.Count, c.Locality, c.Ordinals())
 		if seen[key] {
 			t.Fatalf("repeated corruption set %s", key)
 		}
@@ -243,12 +242,12 @@ func TestSeedsDependOnlyOnTheCaseIdentity(t *testing.T) {
 		var match *Case
 		for index := range full.Cases {
 			f := &full.Cases[index]
-			if f.QueryID == c.QueryID && f.Count == c.Count && f.Pattern == c.Pattern && f.Phase == c.Phase && f.Repetition == c.Repetition {
+			if f.QueryID == c.QueryID && f.Count == c.Count && f.Locality == c.Locality && f.Phase == c.Phase && f.Repetition == c.Repetition {
 				match = f
 			}
 		}
 		if match == nil || !slices.Equal(match.Ordinals(), c.Ordinals()) {
-			t.Fatalf("case %s m=%d %s %s #%d changed when another count was removed", c.QueryID, c.Count, c.Pattern, c.Phase, c.Repetition)
+			t.Fatalf("case %s m=%d %s %s #%d changed when another count was removed", c.QueryID, c.Count, c.Locality, c.Phase, c.Repetition)
 		}
 	}
 }
@@ -262,7 +261,7 @@ func TestCorruptionFailsInsteadOfChangingTheWorkload(t *testing.T) {
 	// A scattered case squeezed into one segment must be rejected.
 	for index := range tampered.Cases {
 		c := &tampered.Cases[index]
-		if c.Pattern == PatternScattered && c.Count == 4 {
+		if c.Locality == LocalityScattered && c.Count == 4 {
 			c.Records = slices.Clone(c.Records)
 			base := c.Records[0]
 			for i := range c.Records {
@@ -289,13 +288,13 @@ func TestCorruptionFailsInsteadOfChangingTheWorkload(t *testing.T) {
 	if ValidateCorruption(queries, tampered, layout) == nil {
 		t.Fatal("a corrupted record outside the query was accepted")
 	}
-	// Sampling fails, rather than relaxing the pattern, when the query cannot support it.
+	// Sampling fails, rather than relaxing the locality, when the query cannot support it.
 	groups := groupBySegment(Query{Ordinals: []int{0, 300, 600, 900}}, layout)
-	if _, err := sampleClustered(newRand(1), groups, 2); err == nil {
-		t.Fatal("clustered sampling succeeded where no segment holds m records")
+	if _, err := sampleClustered(newRand(1), "q1", groups, 2); !IsUnsuitable(err) {
+		t.Fatalf("clustered sampling where no segment holds m records: %v, want an unsuitable-query error", err)
 	}
-	if _, err := sampleScattered(newRand(1), groups, 5); err == nil {
-		t.Fatal("scattered sampling succeeded with fewer segments than m")
+	if _, err := sampleScattered(newRand(1), "q1", groups, 5); !IsUnsuitable(err) {
+		t.Fatalf("scattered sampling of more records than the query holds: %v, want an unsuitable-query error", err)
 	}
 }
 
@@ -332,14 +331,14 @@ func TestPercentileIsNearestRank(t *testing.T) {
 
 func TestSummaryKeepsErrorsAndFallbacksOutOfLatency(t *testing.T) {
 	ok := func(latency float64) RawRow {
-		return RawRow{Algorithm: "ACHP", CorruptionCount: 4, Pattern: PatternClustered, Status: StatusOK,
+		return RawRow{Algorithm: "ACHP", CorruptionCount: 4, Locality: LocalityClustered, Status: StatusOK,
 			LatencyMS: latency, PartitionReads: 10, EvidenceBytes: 640, RetrievalRounds: 3, PlanningMS: 1, CassandraReads: -1}
 	}
 	rows := []RawRow{ok(10), ok(20), ok(30), ok(40)}
 	rows = append(rows,
-		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Pattern: PatternClustered, Status: StatusFallback, LatencyMS: 1, Fallback: true, PlanningMS: -1},
-		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Pattern: PatternClustered, Status: StatusError, LatencyMS: 0, PlanningMS: -1, Missed: 4},
-		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Pattern: PatternClustered, Status: StatusIncorrect, LatencyMS: 2, FalsePositives: 1, Missed: 1, PlanningMS: -1},
+		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Locality: LocalityClustered, Status: StatusFallback, LatencyMS: 1, Fallback: true, PlanningMS: -1},
+		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Locality: LocalityClustered, Status: StatusError, LatencyMS: 0, PlanningMS: -1, Missed: 4},
+		RawRow{Algorithm: "ACHP", CorruptionCount: 4, Locality: LocalityClustered, Status: StatusIncorrect, LatencyMS: 2, FalsePositives: 1, Missed: 1, PlanningMS: -1},
 	)
 	table := Summarize(rows)
 	if len(table) != 1 {
