@@ -512,6 +512,10 @@ func (verifier *groupVerifier) localize(ctx context.Context, group []*candidate)
 	if err := localization.VerifyProof(result.Proof, addresses, verifier.trustedRoot); err != nil {
 		return err
 	}
+	if len(result.Proof.Unresolved) > 0 {
+		return fmt.Errorf("localization could not settle %d branches from authenticated evidence",
+			len(result.Proof.Unresolved))
+	}
 	byAddress := make(map[hpp.PhysicalAddress]*candidate, len(group))
 	for _, item := range group {
 		byAddress[item.address] = item

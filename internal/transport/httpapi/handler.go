@@ -145,6 +145,8 @@ type localizationProofResponse struct {
 	AnchoredGlobalRoot  string                        `json:"anchored_global_root"`
 	AuditorGlobalRoot   string                        `json:"auditor_global_root"`
 	ReferenceGlobalRoot string                        `json:"reference_global_root"`
+	Strategy            localization.Strategy         `json:"strategy,omitempty"`
+	FallbackReason      string                        `json:"fallback_reason,omitempty"`
 	K                   int32                         `json:"k"`
 	Addresses           []hpp.PhysicalAddress         `json:"addresses"`
 	FailedProof         hmfProof                      `json:"failed_proof"`
@@ -152,6 +154,14 @@ type localizationProofResponse struct {
 	BadShards           []hpp.TreeRef                 `json:"bad_shards"`
 	Rounds              []localizationRoundResponse   `json:"rounds"`
 	Suspects            []localizationSuspectResponse `json:"suspects"`
+	// Unresolved lists branches the evidence could not settle (ACHP only).
+	Unresolved []localizationUnresolvedResponse `json:"unresolved,omitempty"`
+}
+
+type localizationUnresolvedResponse struct {
+	Ref         hpp.NodeRef                   `json:"ref"`
+	AuditorHash string                        `json:"auditor_hash"`
+	Reason      localization.UnresolvedReason `json:"reason"`
 }
 
 type localizationRoundResponse struct {
@@ -408,6 +418,7 @@ func localizationProofView(value localization.Proof) localizationProofResponse {
 		AnchoredGlobalRoot:  hashHex(value.AnchoredGlobalRoot),
 		AuditorGlobalRoot:   hashHex(value.AuditorGlobalRoot),
 		ReferenceGlobalRoot: hashHex(value.ReferenceGlobalRoot), K: value.K,
+		Strategy: value.Strategy, FallbackReason: value.FallbackReason,
 		Addresses: value.Addresses, FailedProof: hmfProofView(value.FailedProof),
 		ReferenceProof: hmfProofView(value.ReferenceProof), BadShards: value.BadShards,
 	}
@@ -421,6 +432,11 @@ func localizationProofView(value localization.Proof) localizationProofResponse {
 			})
 		}
 		result.Rounds = append(result.Rounds, converted)
+	}
+	for _, node := range value.Unresolved {
+		result.Unresolved = append(result.Unresolved, localizationUnresolvedResponse{
+			Ref: node.Ref, AuditorHash: hashHex(node.AuditorHash), Reason: node.Reason,
+		})
 	}
 	for _, suspect := range value.Suspects {
 		result.Suspects = append(result.Suspects, localizationSuspectResponse{

@@ -18,18 +18,38 @@ var (
 
 type Service struct {
 	reference ReferenceBuilder
+	strategy  Strategy
+	achp      ACHPConfig
 }
 
-func NewService(reference ReferenceBuilder) (*Service, error) {
+// NewService returns a localization service. Unless an option says otherwise
+// it localizes with ACHP, using DefaultACHPConfig, and falls back to the
+// fixed-depth traversal whenever the reference builder cannot retrieve
+// frontiers or ACHP cannot make progress.
+func NewService(reference ReferenceBuilder, options ...Option) (*Service, error) {
 	if reference == nil {
 		return nil, fmt.Errorf("new localization service: reference builder is nil")
 	}
-	return &Service{reference: reference}, nil
+	service := &Service{reference: reference, strategy: StrategyACHP, achp: DefaultACHPConfig()}
+	for _, option := range options {
+		if err := option(service); err != nil {
+			return nil, fmt.Errorf("new localization service: %w", err)
+		}
+	}
+	return service, nil
 }
 
-// Localize performs one authenticated reference-proof build. It reuses the
-// failed proof's authentication nodes where they are the committed ones, so
-// normally only the stored requested leaves are read again.
+// Localize authenticates the reference state against the anchored root and
+// finds the corrupted leaves under it.
+//
+// With StrategyACHP (the default) it retrieves cost-chosen frontiers of the
+// reference tree round by round, authenticating each before comparing it. With
+// StrategyFixedDepth it performs one authenticated reference-proof build,
+// reusing the failed proof's authentication nodes where they are the committed
+// ones, so normally only the stored requested leaves are read again, and walks
+// the result κ levels per round. An ACHP request that cannot be served (the
+// reference builder lacks frontier retrieval, or ACHP made no progress) is
+// served fixed-depth, and the proof says why in FallbackReason.
 func (service *Service) Localize(ctx context.Context, request Request) (Result, error) {
 	addresses, err := normalizeAddresses(request.Addresses)
 	if err != nil {
@@ -48,6 +68,27 @@ func (service *Service) Localize(ctx context.Context, request Request) (Result, 
 	}
 	if equalHash(request.AuditorGlobalRoot, request.AnchoredGlobalRoot) {
 		return Result{}, ErrNoMismatch
+	}
+
+	strategy := request.Strategy
+	if strategy == StrategyDefault {
+		strategy = service.strategy
+	}
+	fallbackReason := ""
+	switch strategy {
+	case StrategyFixedDepth:
+	case StrategyACHP:
+		result, err := service.localizeACHP(ctx, request, addresses, auditorTrace)
+		if err == nil {
+			return result, nil
+		}
+		var fallback *fallbackError
+		if !errors.As(err, &fallback) {
+			return Result{}, fmt.Errorf("localize tamper: %w", err)
+		}
+		fallbackReason = fallback.reason
+	default:
+		return Result{}, fmt.Errorf("localize tamper: unknown strategy %q", strategy)
 	}
 
 	reference, err := service.authenticatedReference(ctx, request.FailedProof, addresses, request.AnchoredGlobalRoot)
@@ -72,7 +113,8 @@ func (service *Service) Localize(ctx context.Context, request Request) (Result, 
 		AnchoredGlobalRoot:  request.AnchoredGlobalRoot,
 		AuditorGlobalRoot:   request.AuditorGlobalRoot,
 		ReferenceGlobalRoot: referenceTrace.GlobalRoot,
-		K:                   request.K, Addresses: addresses,
+		Strategy:            StrategyFixedDepth, FallbackReason: fallbackReason,
+		K: request.K, Addresses: addresses,
 		FailedProof: request.FailedProof, ReferenceProof: reference.Proof,
 		BadShards: badShards, Rounds: rounds, Suspects: suspects,
 	}
@@ -96,7 +138,8 @@ func (service *Service) authenticatedReference(ctx context.Context, failed hpp.H
 }
 
 // VerifyProof lets the auditor independently authenticate the reference state
-// and replay the complete k-level pruning transcript.
+// and replay the complete pruning transcript: the k-level transcript of a
+// fixed-depth proof, or the authenticated frontier transcript of an ACHP proof.
 func VerifyProof(proof Proof, expectedAddresses []hpp.PhysicalAddress,
 	trustedRoot [32]byte) error {
 
@@ -104,7 +147,17 @@ func VerifyProof(proof Proof, expectedAddresses []hpp.PhysicalAddress,
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidProof, err)
 	}
-	if proof.K != DefaultJumpLevels || !reflect.DeepEqual(addresses, proof.Addresses) {
+	if !reflect.DeepEqual(addresses, proof.Addresses) {
+		return fmt.Errorf("%w: addresses or k do not match", ErrInvalidProof)
+	}
+	switch proof.Strategy {
+	case StrategyACHP:
+		return verifyACHP(proof, addresses, trustedRoot)
+	case StrategyDefault, StrategyFixedDepth:
+	default:
+		return fmt.Errorf("%w: unknown strategy %q", ErrInvalidProof, proof.Strategy)
+	}
+	if proof.K != DefaultJumpLevels {
 		return fmt.Errorf("%w: addresses or k do not match", ErrInvalidProof)
 	}
 	if !equalHash(proof.AnchoredGlobalRoot, trustedRoot) ||

@@ -139,6 +139,7 @@ func TestLocalizeRebuildsReferenceFromFailedProofLeaves(t *testing.T) {
 	result, err := service.Localize(context.Background(), Request{
 		Addresses: fixture.addresses, AuditorGlobalRoot: auditorRoot, FailedProof: failed,
 		AnchoredGlobalRoot: fixture.reference.CalculatedGlobalRoot, K: DefaultJumpLevels,
+		Strategy: StrategyFixedDepth,
 	})
 	if err != nil {
 		t.Fatalf("localize: %v", err)
@@ -177,6 +178,7 @@ func TestLocalizeFallsBackToFullReferenceWhenFailedSiblingDiffers(t *testing.T) 
 	result, err := service.Localize(context.Background(), Request{
 		Addresses: fixture.addresses, AuditorGlobalRoot: auditorRoot, FailedProof: failed,
 		AnchoredGlobalRoot: fixture.reference.CalculatedGlobalRoot, K: DefaultJumpLevels,
+		Strategy: StrategyFixedDepth,
 	})
 	if err != nil {
 		t.Fatalf("localize: %v", err)
